@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>fastbev_ros</name>
+  <version>1.0.0</version>
+  <description>
+    ROS Noetic wrapper for CUDA-FastBEV camera-based 3D object detection.
+    Subscribes to 6 synchronized camera images and publishes MarkerArray detections.
+  </description>
+  <maintainer email="user@example.com">FastBEV Dev</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <depend>roscpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>cv_bridge</depend>
+  <depend>image_transport</depend>
+  <depend>message_filters</depend>
+</package>
