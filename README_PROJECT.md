@@ -1,325 +1,391 @@
-# CUDA-FAST-BEV-W 项目架构与开发路线
+# CUDA-FastBEV-W 项目架构与工程化指南
 
-这个文档不替代现有 [README.md](/home/dfg-autoware/BEV_projects/CUDA-FastBEV/README.md)，而是作为项目级说明，面向后续工程化开发、版本管理和功能扩展。
-
-项目目标不是只停在单帧 3D 检测，而是逐步形成一条完整链路：
-
-`多相机图像 -> 标定/同步 -> BEV 检测 -> 多目标跟踪 -> 轨迹输出 -> ROS/系统集成`
+本文档面向后续工程化开发，描述整条感知链路的架构、各阶段实现状态和可运行命令。  
+它不替代 [README.md](README.md)（快速上手），而是作为更完整的项目级说明。
 
 ---
 
-## 一、项目定位
+## 项目目标
 
-`CUDA-FAST-BEV-W` 面向车端多相机感知研发，核心是把纯视觉 BEV 检测能力做成一个可持续扩展的工程底座。当前仓库已经具备：
+```
+多相机图像 → 标定/同步 → BEV 检测 → 多目标跟踪 → 轨迹输出 → ROS/系统集成
+```
 
-- 基于 TensorRT 的 FastBEV 推理能力
-- 单帧示例数据推理
-- TRT engine 构建脚本
-- 检测结果可视化
-- NuScenes 数据适配脚本
-- ROS 接口雏形
-
-下一阶段的目标，是在这个仓库内继续沉淀：
-
-- 多相机输入管理
-- 在线/离线时序缓存
-- 目标级 tracking
-- 轨迹级输出接口
-- 更完整的系统组织和部署方式
+从单帧视觉 BEV 检测起步，逐步形成可工程化部署的车端多相机感知系统。
 
 ---
 
-## 二、推荐目录组织
+## 当前整体状态
 
-当前仓库已经有可用基础。后续建议以“按能力模块”而不是“按脚本散放”的方式演进。
+| 阶段 | 内容 | 状态 |
+|------|------|------|
+| A | 检测推理链（TRT + C++ 单帧/批量） | ✅ 已实现、可运行 |
+| B | 多相机管理、标定读取、NuScenes 适配 | ✅ 已实现、可运行 |
+| C | 多目标跟踪模块（SORT 风格） | ✅ 已实现（接口完备） |
+| D | 感知管线（检测+跟踪端到端流程） | ✅ 已实现（接口完备） |
+| E | ROS 系统集成与部署 | 🚧 框架完成，待系统联调 |
+
+---
+
+
+---
+
+## 目录结构
 
 ```text
 CUDA-FastBEV/
-├── src/                       # C++ 核心推理与运行时
-│   ├── common/                # Tensor、日志、计时器、可视化、配置解析
-│   ├── fastbev/               # 检测前处理 / TRT 推理 / 后处理
-│   ├── tracking/              # 多目标跟踪（未来新增）
-│   ├── camera/                # 相机管理、时间同步、标定读取（未来新增）
-│   ├── pipeline/              # 从图像到目标轨迹的总流程编排（未来新增）
-│   └── main.cpp               # CLI 入口
-├── tool/                      # 运行、画图、环境脚本
-├── tools/                     # Python 数据准备、视频生成、辅助分析
-├── ros/                       # ROS 节点与消息桥接
-├── configs/                   # 模型、阈值、相机参数、跟踪参数
-├── model/                     # ONNX / plan / 权重（通常不直接纳入 git）
-├── demo/                      # 展示图和示意资源
-├── example-data/              # 轻量示例输入（通常不直接纳入 git）
-├── outputs/                   # 推理结果、视频、日志
-├── nuscenes/                  # 数据索引或实验缓存
-└── docs/                      # 设计文档（后续可新增）
+├── src/
+│   ├── common/                  # Tensor、日志、CUDA 工具、可视化
+│   ├── fastbev/                 # BEV 前处理、TRT 推理、后处理
+│   ├── tracking/                # 多目标跟踪（Track + Tracker）
+│   ├── camera/                  # 相机帧管理、多路缓存、标定读取
+│   ├── pipeline/                # 感知总管线（检测 + 跟踪 + 输出）
+│   └── main.cpp                 # CLI 推理入口
+├── tool/
+│   ├── environment.sh           # 环境变量（TRT/CUDA 路径）
+│   ├── build_trt_engine.sh      # ONNX → TRT engine
+│   ├── run.sh                   # CMake 编译 + 运行
+│   └── draw.py                  # 单帧结果可视化
+├── tools/
+│   ├── nuscenes_adapter.py      # NuScenes → 帧目录格式适配
+│   └── video_demo.py            # 多帧结果渲染为视频
+├── ros/
+│   ├── fastbev_ros_node.cpp     # ROS 节点（检测 + 轨迹发布）
+│   └── README.md
+├── configs/                     # 模型配置
+├── model/                       # TRT plan / ONNX / 权重
+├── example-data/                # 轻量示例输入
+├── data/nuscenes/               # NuScenes v1.0-mini 数据集
+└── outputs/                     # 推理结果 / 视频（运行时生成）
 ```
 
 ---
 
-## 三、当前代码职责
+## 阶段 A：单帧/批量 BEV 检测链
 
-### 1. 检测主链
+### 描述
 
-- [src/main.cpp](/home/dfg-autoware/BEV_projects/CUDA-FastBEV/src/main.cpp)
-  - 主程序入口
-  - 加载图像、几何张量、engine
-  - 执行单帧检测并写出结果
+C++ TensorRT 推理主程序，支持单帧和批量两种模式，输出 TXT/JSON 检测结果。
 
-- `src/fastbev/`
-  - `fastbev_pre.cpp` / `fastbev_post.cpp`
-  - `postprecess.cpp`
-  - 负责前处理、TensorRT 推理封装、框解码、NMS
+### 关键文件
 
-- `src/common/`
-  - Tensor 管理
-  - TensorRT 封装
-  - 可视化几何定义
+- `src/main.cpp` — 推理入口、参数解析、结果保存
+- `src/fastbev/` — 前处理 CUDA kernel、TRT 推理封装、框解码
 
-### 2. 运行与构建
+### 如何运行
 
-- [tool/environment.sh](/home/dfg-autoware/BEV_projects/CUDA-FastBEV/tool/environment.sh)
-  - TensorRT / CUDA / 第三方依赖路径
+**1. 编译（如尚未编译）**
 
-- [tool/build_trt_engine.sh](/home/dfg-autoware/BEV_projects/CUDA-FastBEV/tool/build_trt_engine.sh)
-  - ONNX -> TensorRT engine
-  - 现已支持单模型或 `all` 批量构建
+```bash
+source tool/environment.sh
+mkdir -p build && cd build && cmake .. && make -j4 && cd ..
+```
 
-- [tool/run.sh](/home/dfg-autoware/BEV_projects/CUDA-FastBEV/tool/run.sh)
-  - CMake 编译并运行推理
+**2. 单帧推理（example-data）**
 
-### 3. 数据与展示
+```bash
+source tool/environment.sh
+./build/fastbev example-data/example-data resnet18int8 int8 --score-thr 0.3
+cat model/resnet18int8/result.txt
+```
 
-- [tool/draw.py](/home/dfg-autoware/BEV_projects/CUDA-FastBEV/tool/draw.py)
-  - 读取检测结果并绘制相机 + BEV 可视化
+**3. JSON 输出 + 可视化**
 
-- `tools/nuscenes_adapter.py`
-  - NuScenes 数据向项目输入格式转换
+```bash
+./build/fastbev example-data/example-data resnet18int8 int8 \
+    --score-thr 0.3 --output-format json
+python tool/draw.py --pred-path model/resnet18int8/result.txt \
+    --vis-path outputs/vis.png
+```
 
-- `tools/video_demo.py`
-  - 多帧结果转视频
+**4. 批量推理（多帧目录）**
 
-### 4. 系统接口
+```bash
+./build/fastbev outputs/frames resnet18int8 int8 \
+    --score-thr 0.3 --output-format json --batch --no-warmup
+# 每帧目录下生成 result.json
+```
 
-- `ros/fastbev_ros_node.cpp`
-  - ROS 节点封装基础
-  - 是后续接入在线相机流、发布检测和轨迹消息的入口
+### 推理参数
 
----
-
-## 四、当前项目数据流
-
-当前检测链路可以概括为：
-
-1. 读取 6 路相机图像
-2. 读取几何辅助张量：`valid_c_idx.tensor`、`x.tensor`、`y.tensor`
-3. 执行 `fastbev_pre_trt.plan`
-4. 执行 `fastbev_post_trt_decode.plan`
-5. 输出 3D 检测框：`result.txt`
-6. 通过 `tool/draw.py` 绘制结果图
-
-这条链已经具备“单帧感知”能力，但离“车辆轨迹感知系统”还差两个关键层：
-
-- 时序管理
-- 跟踪管理
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--score-thr` | 置信度阈值 | 0.5 |
+| `--output-format` | `txt` 或 `json` | txt |
+| `--batch` | 批量模式（对 `frame_*/` 目录迭代） | 否 |
+| `--no-warmup` | 关闭 warmup（调试用） | 否 |
+| `--classes` | 类别 ID 过滤（逗号分隔） | 全部 |
 
 ---
 
-## 五、未来开发路线
+## 阶段 B：多相机管理与 NuScenes 数据适配
 
-后续建议按下面顺序推进，这样风险更可控，系统也更容易保持稳定。
+### 描述
 
-### 阶段 A：把检测链打磨成稳定模块
+- `src/camera/` — C++ 多相机帧数据结构与缓冲队列
+- `tools/nuscenes_adapter.py` — 将 NuScenes v1.0-mini 原始数据转为推理帧目录格式
 
-目标：先把当前单帧检测做成稳定、可复现实验结果的基础能力。
+### 关键文件
 
-建议事项：
+| 文件 | 功能 |
+|------|------|
+| `src/camera/camera_frame.hpp` | 单帧数据结构（6路图像 + 几何张量 + 时间戳） |
+| `src/camera/multi_camera_buffer.hpp` | 线程安全多帧缓冲队列 |
+| `src/camera/calibration.hpp` | 相机标定参数读取接口 |
+| `tools/nuscenes_adapter.py` | NuScenes → 帧目录（图像 + 几何张量 + meta.json） |
 
-- 统一配置文件，不把关键阈值散落在源码和脚本中
-- 明确 `model/`、`outputs/`、`example-data/` 的输入输出边界
-- 为推理结果补充 `json` 输出格式
-- 保留单帧和批量离线两种运行方式
+### 几何张量说明
 
-### 阶段 B：接入多相机工程输入
+每个帧目录包含三个预计算张量：
 
-目标：把离线图片输入扩展到真实多相机流。
+| 文件 | 形状 | 含义 |
+|------|------|------|
+| `valid_c_idx.tensor` | `[6, 160000]` float32 | 各体素是否落在该相机有效视野内 |
+| `x.tensor` | `[6, 160000]` int64 | 特征图 x 坐标（0–175） |
+| `y.tensor` | `[6, 160000]` int64 | 特征图 y 坐标（0–63） |
 
-建议新增模块：
+**重要**：C++ 硬编码期望 `1600×900` 输入图像，内部 CUDA kernel 做等比 resize（×0.44）和 center crop（crop_y=70）。
+适配器保存原始分辨率图像，K 矩阵也相应做 resize_lim + crop 修正后再用于几何计算。
 
-- `src/camera/`
-  - 相机配置读取
-  - 时间戳同步
-  - 多路图像缓存
-  - 标定参数加载
+### 如何运行
 
-建议能力：
+**从 NuScenes v1.0-mini 准备帧数据**
 
-- 支持离线图像目录输入
-- 支持 ROS topic 输入
-- 支持按相机名管理图像
+```bash
+conda activate bev
+python tools/nuscenes_adapter.py \
+    --nuscenes-dir data/nuscenes \
+    --version v1.0-mini \
+    --out-dir outputs/frames \
+    --num-frames 40
+```
 
-### 阶段 C：加入 Tracking
+指定场景（可选）：
 
-目标：把检测结果升级成连续目标轨迹。
+```bash
+python tools/nuscenes_adapter.py \
+    --nuscenes-dir data/nuscenes \
+    --scene-names scene-0061,scene-0103 \
+    --num-frames 40 \
+    --out-dir outputs/frames
+```
 
-建议新增模块：
-
-- `src/tracking/`
-  - Track 数据结构
-  - 状态机（new / tracked / lost / removed）
-  - 关联器（IoU / center distance / velocity gating）
-  - 卡尔曼滤波器或简化运动模型
-
-建议输出：
-
-- 每个目标的 `track_id`
-- 轨迹历史点
-- 速度和朝向平滑结果
-
-这一步完成后，系统就从“检测器”变成了“感知跟踪器”。
-
-### 阶段 D：形成统一感知管线
-
-目标：打通从图像到轨迹输出的主流程。
-
-建议新增模块：
-
-- `src/pipeline/`
-  - `PerceptionPipeline`
-  - `FrameContext`
-  - `DetectionStage`
-  - `TrackingStage`
-  - `OutputStage`
-
-目标输出：
-
-- 检测框
-- 目标轨迹
-- 可视化结果
-- ROS 发布消息
-- 日志和性能统计
-
-### 阶段 E：面向实车/系统部署
-
-目标：真正接近可部署的车端感知工程。
-
-建议事项：
-
-- 参数热加载
-- 多线程或流水线并行
-- GPU/CPU 资源监控
-- 输入异常保护
-- 轨迹超时清理
-- 录包与回放工具
-- 在线调试可视化
-
----
-
-## 六、建议优先新增的代码模块
-
-如果马上开始下一阶段开发，我建议优先落这几个文件：
+输出目录结构：
 
 ```text
-src/
-├── tracking/
-│   ├── track.hpp
-│   ├── track.cpp
-│   ├── tracker.hpp
-│   ├── tracker.cpp
-│   └── kalman_filter.hpp
-├── camera/
-│   ├── camera_frame.hpp
-│   ├── multi_camera_buffer.hpp
-│   ├── calibration.hpp
-│   └── calibration.cpp
-├── pipeline/
-│   ├── perception_pipeline.hpp
-│   └── perception_pipeline.cpp
+outputs/frames/
+├── frame_00000/
+│   ├── 0-FRONT.jpg           # 1600×900, RGB（C++ 期望尺寸）
+│   ├── 1-FRONT_RIGHT.jpg
+│   ├── ...
+│   ├── 5-BACK_RIGHT.jpg
+│   ├── valid_c_idx.tensor
+│   ├── x.tensor
+│   ├── y.tensor
+│   └── meta.json             # 帧元信息（时间戳、sample token 等）
+├── frame_00001/
+│   └── ...
+└── manifest.json             # 所有帧的索引
 ```
 
-优先级建议：
+---
 
-1. `tracker`
-2. `multi_camera_buffer`
-3. `perception_pipeline`
-4. ROS 输出轨迹消息
+## 阶段 C：多目标跟踪模块
+
+### 描述
+
+基于 BEV 检测结果的在线多目标跟踪，采用贪心匈牙利匹配（center distance）+ 低通滤波运动模型。
+
+### 关键文件
+
+| 文件 | 功能 |
+|------|------|
+| `src/tracking/track.hpp` | Track 数据结构、状态机、低通滤波预测 |
+| `src/tracking/tracker.hpp` + `.cpp` | 多目标跟踪器（创建/更新/删除轨迹） |
+
+### Track 状态机
+
+```
+New → Active → Lost → Removed
+           ↑_____|  （重新匹配）
+```
+
+### 数据接口
+
+```cpp
+// 输入：BEV 检测框
+struct Detection {
+    float x, y, z;        // 3D 中心坐标
+    float w, l, h;        // 尺寸
+    float yaw;            // 朝向（rad）
+    float vx, vy;         // 速度
+    float score;          // 置信度
+    int   class_id;       // 类别
+};
+
+// 输出：已确认目标轨迹列表
+std::vector<Track> confirmed_tracks = tracker.update(detections, timestamp);
+
+// Track 核心属性
+track.track_id;       // 唯一 ID
+track.x, track.y;    // 平滑后的 BEV 位置
+track.vx, track.vy;  // 估计速度
+track.history;        // 轨迹点历史（最近 30 帧）
+```
+
+### 跟踪配置
+
+```cpp
+TrackerConfig cfg;
+cfg.max_dist        = 3.0f;   // 匹配距离阈值（米）
+cfg.max_lost_frames = 3;      // 最多连续丢失帧数
+cfg.min_hits_confirm= 2;      // 确认目标所需最少匹配次数
+cfg.dt              = 0.05f;  // 时间步长（秒）
+```
 
 ---
 
-## 七、版本管理建议
+## 阶段 D：感知管线（端到端流程）
 
-这个仓库后续建议只管理“代码、配置、文档、轻量 demo 资源”，不要把大模型和大数据直接入库。
+### 描述
 
-建议 git 管理范围：
+`PerceptionPipeline` 将 BEV 检测与多目标跟踪串联，接收多相机帧，输出检测框和目标轨迹。
 
-- `src/`
-- `tool/`
-- `tools/`
-- `ros/`
-- `configs/`
-- `demo/`
-- `README.md`
-- `README_PROJECT.md`
+### 关键文件
 
-建议忽略：
+| 文件 | 功能 |
+|------|------|
+| `src/pipeline/perception_pipeline.hpp` | 管线接口定义 |
+| `src/pipeline/perception_pipeline.cpp` | 管线实现（初始化、推理、跟踪、回调） |
 
-- `build/`
-- `outputs/`
-- `nuscenes/`
-- `example-data/`
-- `model/`
-- TensorRT `.plan`
-- 中间日志和缓存
+### 管线数据流
 
----
+```
+CameraFrame
+    ↓
+[1] update_geometry_tensors()   ← valid_c_idx / x / y 上传 GPU
+    ↓
+[2] core->forward(images)       ← TRT 推理（前处理 + backbone + BEV head）
+    ↓
+[3] filter_boxes(score_thr)     ← 阈值过滤 + 类别过滤
+    ↓
+[4] tracker.update(detections)  ← 多目标跟踪（可选）
+    ↓
+[5] result_callback(result)     ← 用户自定义回调（保存、发布、可视化）
+```
 
-## 八、项目里程碑定义
+### 使用示例
 
-建议把后续开发目标拆成四个里程碑：
+```cpp
+PipelineConfig cfg;
+cfg.model_name      = "resnet18int8";
+cfg.score_thr       = 0.3f;
+cfg.enable_tracking = true;
+cfg.output_dir      = "outputs/frames";
+cfg.output_format   = "json";
 
-### M1：稳定检测版
+PerceptionPipeline pipeline;
+pipeline.init(cfg);
+pipeline.set_callback([](const PerceptionResult& result) {
+    printf("帧 %d: %zu 检测, %zu 轨迹\n",
+           result.frame_id, result.detections.size(), result.tracks.size());
+});
 
-- TRT 检测稳定运行
-- 单帧 / 批量 / 可视化完整
-
-### M2：多相机输入版
-
-- 支持真实多相机输入
-- 支持标定和时间同步
-
-### M3：轨迹输出版
-
-- 引入 tracking
-- 输出 `track_id` 和轨迹历史
-
-### M4：系统集成版
-
-- ROS 在线发布
-- 视频展示
-- 录包、回放、调试工具齐备
-
----
-
-## 九、最终目标
-
-最终希望这个仓库演进成一个完整的视觉感知工程，而不是一个只跑单帧 demo 的模型仓库。
-
-目标形态是：
-
-- 输入：多路相机图像
-- 中间：BEV 检测 + 时序跟踪
-- 输出：障碍物检测框、目标 ID、轨迹、速度、可视化结果、ROS 消息
-
-也就是一条真正可持续扩展的链路：
-
-`Image -> BEV Detection -> Multi-Object Tracking -> Trajectory -> System Integration`
+CameraFrame frame = FrameLoader::load_from_dir("outputs/frames/frame_00000", 0);
+pipeline.process(frame, stream);
+pipeline.reset_tracker();  // 切换场景时重置
+```
 
 ---
 
-## 十、建议下一步
+## 阶段 E：ROS 集成与系统部署
 
-如果按这个路线继续做，最值得马上开始的是两件事：
+### 描述
 
-1. 把 `tracking/` 模块加进来
-2. 把 `camera/` 和 `pipeline/` 组织起来
+ROS 节点封装，订阅相机 topic，发布检测框和目标轨迹。
 
-这样后面无论你接真实车载相机，还是接 ROS 在线输入，整个项目都不会越改越散。
+### 关键文件
+
+| 文件 | 功能 |
+|------|------|
+| `ros/fastbev_ros_node.cpp` | ROS 节点实现 |
+| `ros/README.md` | 编译和运行说明 |
+
+### 订阅/发布接口
+
+```
+订阅:  /camera/front/image_raw, /camera/front_right/image_raw, ...（6路）
+发布:  /fastbev/detections  (vision_msgs/Detection3DArray)
+       /fastbev/tracks       (std_msgs/String, JSON)
+       /fastbev/bev_image    (sensor_msgs/Image)
+```
+
+### 当前状态
+
+- ✅ 节点结构、CMakeLists、launch 文件框架完成
+- ✅ TRT 推理核心与 ROS 桥接代码完成
+- 🚧 需要与实际相机驱动联调
+- 🚧 消息类型待根据下游需求确认
+
+---
+
+## 完整端到端运行示例
+
+### 1. 基础链路（example-data）
+
+```bash
+source tool/environment.sh
+./build/fastbev example-data/example-data resnet18int8 int8 --score-thr 0.3
+python tool/draw.py --pred-path model/resnet18int8/result.txt --vis-path outputs/vis.png
+```
+
+### 2. NuScenes 全链路
+
+```bash
+conda activate bev
+
+# Step 1: NuScenes → 帧目录
+python tools/nuscenes_adapter.py \
+    --nuscenes-dir data/nuscenes --version v1.0-mini \
+    --out-dir outputs/frames --num-frames 40
+
+# Step 2: 批量推理（结果存入各帧目录）
+source tool/environment.sh
+./build/fastbev outputs/frames resnet18int8 int8 \
+    --score-thr 0.3 --output-format json --batch --no-warmup
+
+# Step 3: 视频生成
+conda activate bev
+python tools/video_demo.py \
+    --frames-dir outputs/frames --out-dir outputs/video \
+    --score-thr 0.3 --fps 6
+# → outputs/video/fastbev_demo.mp4
+```
+
+### 3. auto-infer 模式（边推理边渲染）
+
+```bash
+conda activate bev
+python tools/video_demo.py \
+    --frames-dir outputs/frames --out-dir outputs/video \
+    --model resnet18int8 --score-thr 0.3 --auto-infer --fps 6
+```
+
+---
+
+## 已知问题与注意事项
+
+| 问题 | 原因 | 状态 |
+|------|------|------|
+| NuScenes 帧 0 检测（已修复） | `cv2.imwrite` 保存 BGR，`stbi_load` 读为 RGB，通道颠倒 | ✅ 修复：保存前转 `img[:,:,::-1]` |
+| NuScenes 帧 0 检测（已修复） | Python 适配器缩放图像至 704×256，C++ 按 1600×900 读取缓冲区越界 | ✅ 修复：不缩放，保存原始分辨率 |
+| K 矩阵 y 方向偏移（已修复） | 用非等比缩放 `256/900`，应为等比 `0.44` + `crop_y=70` | ✅ 修复 |
+| auto-infer 结果路径错误（已修复） | 单帧模式写 `model/<model>/result.json`，非帧目录 | ✅ 修复：`video_demo.py` 自动复制 |
+
+---
+
+## 版本管理建议
+
+纳入 git：`src/  tool/  tools/  ros/  configs/  demo/  README.md  README_PROJECT.md`
+
+`.gitignore`：`build/  outputs/  data/  model/*.plan  model/*/build/  example-data/  __pycache__/`
