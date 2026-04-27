@@ -1,3 +1,9 @@
+1. 当前开发不要修改tracking部分，目前有人在开发这一部分，后续我需要使用分支融合代码，避免冲突。
+2. 目前已经完成单帧的检测，nusences数据集的适配，以及可视化，目前需要完成其他部分的整体开发。
+3. 当前单帧目标检测和基于nusences的目标检测还是有一些不准，针对一些对象还会出现一些位置上的偏移。请你从数据输入，模型推理等层次去检测代码是否有什么问题，能提升效果。如果能提升就保留，不能提升还是使用原来的逻辑。
+4.需要建立一个规则用一些指标如置信度，类别等显式的对于目标检测的物体进行滤除，以提升项目的可用性。一定要保证接口的方便，且能适配整个实时推理-检测-跟踪-输出的pipeline。 
+5. 适配多路相机图像输入，反复调试，保证在当前相机输入能够适配BEV算法的输入接口
+
 # CUDA-FastBEV — 高性能纯视觉 BEV 3D 目标检测
 
 基于 NVIDIA TensorRT 的 [FastBEV](https://github.com/Sense-GVT/Fast-BEV) 纯相机 BEV 感知推理框架。支持 NuScenes 原始数据、多帧视频可视化、多目标跟踪接口及 ROS Noetic 实时接口。
@@ -5,18 +11,6 @@
 > **原版说明**: This repository contains sources and model for Fast-BEV inference using CUDA & TensorRT, with PTQ/QAT int8 quantization support.
 
 **完整链路**：`多相机图像 → 标定/同步 → BEV 检测 → 多目标跟踪 → 轨迹输出 → ROS/系统集成`
-1、python tool/draw.py --pred-path model/resnet18/result.txt 
-                    --vis-path  model/resnet18/vis.png将这个单帧绘制的结果也能通过nusences的数据集生成视频。
-2、另外当前运行python tools/video_demo.py 
-    --frames-dir outputs/frames 
-    --out-dir    outputs/video 
-    --model      resnet18int8 
-    --score-thr  0.3 
-    --auto-infer 
-    --fps 6是能够生成结果，也有检测框，但绘制的时候没有开了其他车辆和自车的相对关系，绘制出来很乱，航向角明显不对，自车也没有速度。因此这里你需要重点区改进。另外箭头也不要绘制出来重点是看车的状态。你需要考虑绘制出来的障碍物的具体类别，比如人就绘制小一点等。具体可以参考python tool/draw.py的绘制方式。然后3Dbox在图像上最好也绘制出来，如python tool/draw.py一样。自车速度，自车航向和自车信息均需要考虑。
-3、最后当前如果先运行Step 1 · NuScenes 数据适配中生成frames，在使用绘图的demo去绘图和视频，还是会出现0帧的报错。请你将这个bug也修复。
-
-
 ---
 
 ## 目录结构

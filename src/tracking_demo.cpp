@@ -34,8 +34,7 @@
 #include <dirent.h>
 #include <algorithm>
 
-// stb_image 函数实现由 src/common/stb_image_impl.cpp 提供（libfastbev_core.so 导出）
-// 此处仅包含声明
+#define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -46,6 +45,8 @@
 #include "common/tensor.hpp"
 #include "common/timer.hpp"
 #include "common/visualize.hpp"
+#include "tracking/tracker.hpp"
+#include "tracking/track.hpp"
 
 // ─── NuScenes 10 类名称 ────────────────────────────────────────────────────
 static const char* CLASS_NAMES[] = {
@@ -64,7 +65,6 @@ struct InferConfig {
   bool        batch_mode    = false;  // true: data_dir 下有 frame_* 子目录
   bool        do_warmup     = true;
   std::set<int> class_filter;         // 空 = 保留全部类别
-  float       nms_bev_dist  = 0.0f;   // BEV 中心距离 NMS 阈值(米)，0=不启用
 };
 
 // ─── 工具函数 ──────────────────────────────────────────────────────────────
@@ -107,49 +107,19 @@ static void free_images(std::vector<unsigned char*>& images) {
   images.clear();
 }
 
-// ─── 过滤函数 ──────────────────────────────────────────────────────────────────────────────────
+// ─── 过滤函数 ──────────────────────────────────────────────────────────────
 
 static std::vector<fastbev::post::transbbox::BoundingBox> filter_boxes(
     const std::vector<fastbev::post::transbbox::BoundingBox>& boxes,
     float score_thr,
-    const std::set<int>& class_filter,
-    float nms_bev_dist = 0.0f)
+    const std::set<int>& class_filter)
 {
-  // 1. 置信度 + 类别过滤
   std::vector<fastbev::post::transbbox::BoundingBox> result;
   for (const auto& box : boxes) {
     if (box.score < score_thr) continue;
     if (!class_filter.empty() && class_filter.find(box.id) == class_filter.end()) continue;
     result.push_back(box);
   }
-
-  // 2. BEV 中心距离 NMS（同类别内加权 score 降序，保留高分框）
-  if (nms_bev_dist > 0.0f && result.size() > 1) {
-    float dist_sq = nms_bev_dist * nms_bev_dist;
-    // 按 score 降序排序
-    std::sort(result.begin(), result.end(),
-              [](const fastbev::post::transbbox::BoundingBox& a,
-                 const fastbev::post::transbbox::BoundingBox& b) {
-                return a.score > b.score;
-              });
-    std::vector<bool> suppressed(result.size(), false);
-    for (size_t i = 0; i < result.size(); ++i) {
-      if (suppressed[i]) continue;
-      for (size_t j = i + 1; j < result.size(); ++j) {
-        if (suppressed[j]) continue;
-        if (result[i].id != result[j].id) continue;  // 仅对同类做 NMS
-        float dx = result[i].position.x - result[j].position.x;
-        float dy = result[i].position.y - result[j].position.y;
-        if (dx * dx + dy * dy < dist_sq)
-          suppressed[j] = true;
-      }
-    }
-    std::vector<fastbev::post::transbbox::BoundingBox> kept;
-    for (size_t i = 0; i < result.size(); ++i)
-      if (!suppressed[i]) kept.push_back(result[i]);
-    result = std::move(kept);
-  }
-
   return result;
 }
 
@@ -243,8 +213,7 @@ static std::shared_ptr<fastbev::Core> create_core(
   normalization.output_height= 256;
   normalization.num_camera   = 6;
   normalization.resize_lim   = 0.44f;
-  // 双线性插值与训练预处理对齐，可提升边缘区域检测精度
-  normalization.interpolation= fastbev::pre::Interpolation::Bilinear;
+  normalization.interpolation= fastbev::pre::Interpolation::Nearest;
 
   float mean[3] = {123.675f, 116.28f, 103.53f};
   float std_v[3] = {58.395f,  57.12f,  57.375f};
@@ -298,7 +267,7 @@ static int run_single_frame(
   core->update(valid_c_idx.ptr<float>(), valid_x.ptr<int64_t>(), valid_y.ptr<int64_t>(), stream);
 
   auto all_boxes = core->forward((const unsigned char**)images.data(), stream);
-  auto boxes     = filter_boxes(all_boxes, cfg.score_thr, cfg.class_filter, cfg.nms_bev_dist);
+  auto boxes     = filter_boxes(all_boxes, cfg.score_thr, cfg.class_filter);
   save_boxes(boxes, output_path, cfg.output_format);
 
   free_images(images);
@@ -354,8 +323,6 @@ static InferConfig parse_args(int argc, char** argv) {
       cfg.batch_mode = true;
     } else if (arg == "--no-warmup") {
       cfg.do_warmup = false;
-    } else if (arg == "--nms-dist" && i + 1 < argc) {
-      cfg.nms_bev_dist = static_cast<float>(atof(argv[++i]));
     }
   }
   return cfg;
@@ -404,6 +371,13 @@ int main(int argc, char** argv) {
     }
     printf("批量推理 %zu 帧...\n", frame_dirs.size());
 
+    // 初始化跟踪器
+    fastbev::tracking::TrackerConfig tracker_cfg;
+    tracker_cfg.max_dist = 3.0f;          // 匹配距离阈值（米）
+    tracker_cfg.max_lost_frames = 3;      // 丢失帧数上限
+    // 根据你实际 tracking 模块的配置补充其他参数（例如 min_hits 等）
+    fastbev::tracking::Tracker tracker(tracker_cfg);
+
     // warmup
     if (cfg.do_warmup) {
       std::string first_root = resolve_data_root(frame_dirs[0]);
@@ -418,16 +392,84 @@ int main(int argc, char** argv) {
     }
 
     int total_boxes = 0;
+    double timestamp = 0.0;
+    double fps = 6.0;   // 可以根据实际帧率调整，或从数据中读取
+
     for (const auto& fdir : frame_dirs) {
       std::string data_root = resolve_data_root(fdir);
-      // 提取帧名作为输出文件名
       std::string frame_name = fdir.substr(fdir.rfind('/') + 1);
       std::string out_path   = fdir + "/result" + ext;
-      int n = run_single_frame(core, data_root, out_path, stream, cfg);
-      if (n >= 0) total_boxes += n;
-    }
-    printf("批量完成: 共 %zu 帧，总检测框 %d 个\n", frame_dirs.size(), total_boxes);
 
+      // 执行推理（与原代码相同）
+      auto images = load_images(data_root);
+      bool any_valid = false;
+      for (auto* img : images) if (img) { any_valid = true; break; }
+      if (!any_valid) {
+        fprintf(stderr, "[错误] 无法加载图像，跳过: %s\n", data_root.c_str());
+        free_images(images);
+        continue;
+      }
+
+      auto valid_c_idx = nv::Tensor::load(nv::format("%s/valid_c_idx.tensor", data_root.c_str()), false);
+      auto valid_x     = nv::Tensor::load(nv::format("%s/x.tensor",           data_root.c_str()), false);
+      auto valid_y     = nv::Tensor::load(nv::format("%s/y.tensor",           data_root.c_str()), false);
+      if (valid_c_idx.empty() || valid_x.empty() || valid_y.empty()) {
+        fprintf(stderr, "[错误] 无法加载几何张量: %s\n", data_root.c_str());
+        free_images(images);
+        continue;
+      }
+
+      core->update(valid_c_idx.ptr<float>(), valid_x.ptr<int64_t>(), valid_y.ptr<int64_t>(), stream);
+      auto all_boxes = core->forward((const unsigned char**)images.data(), stream);
+      auto boxes     = filter_boxes(all_boxes, cfg.score_thr, cfg.class_filter);
+      free_images(images);
+
+      // 保存检测结果（与原代码相同）
+      save_boxes(boxes, out_path, cfg.output_format);
+      total_boxes += boxes.size();
+
+      // ========== tracking：将检测框转换为跟踪模块需要的 Detection 格式 ==========
+      std::vector<fastbev::tracking::Detection> detections;
+      for (const auto& box : boxes) {
+        fastbev::tracking::Detection det;
+        // 根据你的 tracking 模块实际定义赋值（请参考 track.hpp / tracker.hpp）
+        det.position = {box.position.x, box.position.y, box.position.z};
+        det.size     = {box.size.w, box.size.l, box.size.h};
+        det.yaw      = box.z_rotation;
+        det.label    = box.id;
+        det.score    = box.score;
+        det.velocity = {box.velocity.vx, box.velocity.vy};
+        // 如果 Detection 需要 timestamp，则添加
+        // det.timestamp = timestamp;
+        detections.push_back(det);
+      }
+
+      // 更新跟踪器，得到轨迹
+      auto tracks = tracker.update(detections, timestamp);
+
+      // 可选：输出跟踪结果（打印或保存到文件）
+      printf("帧 %s: 检测框 %zu, 跟踪轨迹 %zu\n", frame_name.c_str(), boxes.size(), tracks.size());
+
+      // 为每一帧保存轨迹到单独文件（例如 result_tracks.json）
+      if (cfg.output_format == "json") {
+        std::string track_path = fdir + "/tracks.json";
+        std::ofstream ofs(track_path);
+        // 简单输出，实际应按 JSON 格式
+        ofs << "[\n";
+        for (size_t i = 0; i < tracks.size(); ++i) {
+          const auto& trk = tracks[i];
+          ofs << "  {\"track_id\": " << trk.id << ", \"position\": [" 
+              << trk.position.x << "," << trk.position.y << "," << trk.position.z << "]}\n";
+          if (i != tracks.size()-1) ofs << ",";
+        }
+        ofs << "]\n";
+        ofs.close();
+      }
+
+      timestamp += 1.0 / fps;
+    }
+
+    printf("批量完成: 共 %zu 帧，总检测框 %d 个\n", frame_dirs.size(), total_boxes);
   } else {
     // ── 单帧模式 ──
     std::string data_root = resolve_data_root(cfg.data_dir);

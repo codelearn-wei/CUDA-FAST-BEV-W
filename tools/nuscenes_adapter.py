@@ -205,7 +205,8 @@ def prepare_frame_from_pth(pth_path: str, out_dir: Path, frame_idx: int = 0,
                 orig_path = img_info.get("filename", "")
                 if orig_path and Path(orig_path).exists():
                     img = cv2.imread(orig_path)
-                    cv2.imwrite(str(dst), img)
+                    # cv2 读取为 BGR；C++ stb_image 按 RGB 解析 JPEG → 翻转通道
+                    cv2.imwrite(str(dst), img[:, :, ::-1])
                 else:
                     print(f"  [警告] 找不到图像: {src}")
             except Exception:
@@ -341,7 +342,8 @@ def _prepare_single_nuscenes_info(
 
         short_name = name_to_short[cam_name]
         out_img_path = frame_dir / f"{cam_idx}-{short_name}.jpg"
-        cv2.imwrite(str(out_img_path), img)
+        # cv2 读取为 BGR；C++ stb_image 按 RGB 解析 JPEG → 翻转通道
+        cv2.imwrite(str(out_img_path), img[:, :, ::-1])
 
     # ── 计算几何张量 ──────────────────────────────────────────────────────
     extrinsics = []
@@ -601,8 +603,9 @@ def prepare_frames_from_nuscenes_raw(
                 print(f"  [警告] 无法读取: {img_path}")
                 img = np.zeros((orig_h, orig_w, 3), dtype=np.uint8)
             # C++ 期望原始分辨率（1600×900），内部 CUDA kernel 做 resize+crop
+            # cv2 读取为 BGR；C++ stb_image 按 RGB 解析 JPEG → 翻转通道
             short_name = name_to_short[cam_name]
-            cv2.imwrite(str(frame_dir / f"{cam_idx}-{short_name}.jpg"), img)
+            cv2.imwrite(str(frame_dir / f"{cam_idx}-{short_name}.jpg"), img[:, :, ::-1])
 
             # ── 内参：镜像 C++ 的 resize_lim + center_crop 变换 ─────────
             # C++ 做: resize(1600×900, resize_lim=0.44) → 704×396
