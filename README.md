@@ -187,6 +187,18 @@ python tools/video_demo.py
     --auto-infer 
     --fps 6
 
+
+python tools/video_demo.py 
+  --frames-dir outputs/frames 
+  --out-dir outputs/video 
+  --score-thr 0.25 
+  --fps 6 
+  --bev-size 800 
+  --cam-width 480 
+  --bev-mode world 
+  --ego-heading-offset-deg 90
+
+
 # 输出: outputs/video/fastbev_demo.mp4
 ```
 
