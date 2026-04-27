@@ -31,6 +31,7 @@ struct PipelineConfig {
     // 过滤
     float  score_thr    = 0.4f;
     std::vector<int> class_filter;  // 空=全部
+    float  nms_bev_dist = 0.8f;     // BEV 中心距离 NMS（米），0=不启用
 
     // 跟踪
     bool   enable_tracking   = true;

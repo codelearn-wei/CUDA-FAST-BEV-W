@@ -38,6 +38,20 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+# 加载检测后处理滤波器（可选，失败时降级为简单 score 过滤）
+try:
+    from tools.detection_filter import DetectionFilter, FilterConfig
+    _FILTER_AVAILABLE = True
+except ImportError:
+    try:
+        import sys
+        import os
+        sys.path.insert(0, os.path.dirname(__file__))
+        from detection_filter import DetectionFilter, FilterConfig
+        _FILTER_AVAILABLE = True
+    except ImportError:
+        _FILTER_AVAILABLE = False
+
 # ─── NuScenes 类别配置 ────────────────────────────────────────────────────────
 CLASS_NAMES = [
     "car", "truck", "construction_vehicle", "bus", "trailer",
@@ -743,6 +757,13 @@ def parse_args():
                    help="C++ 推理二进制路径")
     p.add_argument("--num-frames", type=int, default=None,
                    help="最多处理帧数（默认全部）")
+    # ── 过滤器选项 ──
+    p.add_argument("--no-size-filter", action="store_true",
+                   help="禁用尺寸范围过滤")
+    p.add_argument("--no-vel-filter",  action="store_true",
+                   help="禁用速度合理性过滤")
+    p.add_argument("--bev-nms-dist",   type=float, default=0.8,
+                   help="BEV 中心距离 NMS 阈值（米），0=禁用，默认 0.8")
     return p.parse_args()
 
 
@@ -776,7 +797,23 @@ def main():
 
     print(f"共 {len(frame_dirs)} 帧，开始渲染...")
 
-    # ── 推理：按需自动触发批量推理（无论是否带 --auto-infer） ────────────────
+    # ── 构建检测滤波器 ────────────────────────────────────────────────
+    det_filter = None
+    if _FILTER_AVAILABLE:
+        class_ids = None
+        if args.classes:
+            class_ids = {int(c.strip()) for c in args.classes.split(',') if c.strip()}
+        det_filter = DetectionFilter(FilterConfig(
+            score_thr=args.score_thr,
+            class_ids=class_ids,
+            enable_size_filter=not args.no_size_filter,
+            enable_velocity_filter=not args.no_vel_filter,
+            bev_nms_dist=args.bev_nms_dist,
+        ))
+        print(f"[过滤器] score>={args.score_thr}  "
+              f"size={'on' if not args.no_size_filter else 'off'}  "
+              f"vel={'on' if not args.no_vel_filter else 'off'}  "
+              f"bev-nms={args.bev_nms_dist}m")
     missing = [d for d in frame_dirs if not (d / "result.json").exists()]
     if missing:
         print(f"[推理] {len(missing)}/{len(frame_dirs)} 帧缺少 result.json，触发批量推理...")
@@ -857,8 +894,11 @@ def main():
         prev_timestamp       = timestamp
         prev_ego_yaw_global  = ego_yaw_global
 
-        # 按 score_thr 过滤
-        detections = [d for d in all_dets if d.get("score", 0) >= args.score_thr]
+        # 按 score_thr 过滤（或使用完整规则过滤器）
+        if det_filter is not None:
+            detections = det_filter.filter(all_dets)
+        else:
+            detections = [d for d in all_dets if d.get("score", 0) >= args.score_thr]
         display_yaw_global = None
         if ego_motion_yaw_global is not None:
             display_yaw_global = ego_motion_yaw_global + math.radians(args.ego_heading_offset_deg)

@@ -43,8 +43,8 @@ bool PerceptionPipeline::init() {
     normalization.output_height = 256;
     normalization.num_camera    = 6;
     normalization.resize_lim    = 0.44f;
-    normalization.interpolation = pre::Interpolation::Nearest;
-
+  // 双线性插值与训练预处理对齐
+  normalization.interpolation = pre::Interpolation::Bilinear;
     float mean[3]  = {123.675f, 116.28f, 103.53f};
     float std_v[3] = { 58.395f,  57.12f,  57.375f};
     normalization.method = pre::NormMethod::mean_std(mean, std_v, 1.0f, 0.0f);
@@ -140,6 +140,31 @@ PerceptionResult PerceptionPipeline::process(const camera::CameraFrame& frame,
 
     // 过滤 + 转换
     result.detections = filter_and_convert(raw_boxes);
+
+    // BEV 中心距离 NMS
+    if (cfg_.nms_bev_dist > 0.0f && result.detections.size() > 1) {
+        float dist_sq_thr = cfg_.nms_bev_dist * cfg_.nms_bev_dist;
+        std::sort(result.detections.begin(), result.detections.end(),
+                  [](const tracking::Detection& a, const tracking::Detection& b) {
+                      return a.score > b.score;
+                  });
+        std::vector<bool> suppressed(result.detections.size(), false);
+        for (size_t i = 0; i < result.detections.size(); ++i) {
+            if (suppressed[i]) continue;
+            for (size_t j = i + 1; j < result.detections.size(); ++j) {
+                if (suppressed[j]) continue;
+                if (result.detections[i].class_id != result.detections[j].class_id) continue;
+                float dx = result.detections[i].x - result.detections[j].x;
+                float dy = result.detections[i].y - result.detections[j].y;
+                if (dx * dx + dy * dy < dist_sq_thr)
+                    suppressed[j] = true;
+            }
+        }
+        std::vector<tracking::Detection> kept;
+        for (size_t i = 0; i < result.detections.size(); ++i)
+            if (!suppressed[i]) kept.push_back(result.detections[i]);
+        result.detections = std::move(kept);
+    }
 
     // 多目标跟踪
     if (cfg_.enable_tracking && tracker_) {

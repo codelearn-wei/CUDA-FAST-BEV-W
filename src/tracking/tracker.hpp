@@ -1,69 +1,133 @@
 #pragma once
 /**
- * tracker.hpp — 多目标跟踪器接口
- *
- * 采用简化的 Sort-like 算法：
- *   1. 预测所有现有轨迹
- *   2. 计算检测框与轨迹的代价矩阵（BEV 中心距离）
- *   3. 匈牙利匹配
- *   4. 更新匹配轨迹；为未匹配检测创建新轨迹；标记未匹配轨迹为 Lost/Removed
- *   5. 输出确认轨迹列表
+ * tracker.hpp — 多目标跟踪器接口（对齐 AB3DMOT 框架）
  */
 
 #include "track.hpp"
 #include <memory>
 #include <functional>
+#include <vector>
 
 namespace fastbev {
 namespace tracking {
 
-// ─── 跟踪器参数 ────────────────────────────────────────────────────────────
-
-struct TrackerConfig {
-    float  max_dist          = 3.0f;  // 匹配距离阈值（米）
-    int    max_lost_frames   = 3;     // 允许丢失的最大帧数，超过则移除
-    int    min_hits_confirm  = 2;     // 轨迹确认所需最小匹配次数
-    double dt                = 0.05;  // 帧间时间间隔（秒）
+// ─── 匹配度量类型 ────────────────────────────────────────────
+enum class MetricType {
+    DIST_3D,   // 欧氏距离（中心点）
+    GIOU_3D,   // 3D 广义交并比（后续实现）
+    IOU_3D,    // 3D 交并比
+    MAHALANOBIS // 马氏距离（需协方差）
 };
 
-// ─── 多目标跟踪器 ──────────────────────────────────────────────────────────
+// ─── 匹配算法 ────────────────────────────────────────────────
+enum class AlgoType {
+    HUNGARIAN,   // 匈牙利算法（全局最优）
+    GREEDY       // 贪心近似（当前实现）
+};
 
+// ─── 跟踪器配置（扩展）────────────────────────────────────────
+struct TrackerConfig {
+    // 基础参数
+    float max_dist          = 3.0f;   // 距离/代价阈值（注意：距离度量时阈值为负）
+    int   min_hits          = 3;      // 轨迹确认所需的最小匹配次数
+    int   max_lost_frames   = 2;      // 允许丢失的最大帧数（超过则移除）
+    double dt               = 0.05;   // 帧间时间间隔（秒）
+
+    // 匹配相关
+    MetricType metric       = MetricType::DIST_3D;
+    AlgoType   algo         = AlgoType::GREEDY;
+    float      threshold    = 0.5f;   // 统一阈值（距离取负，IoU/GIoU 直接使用）
+
+    // 功能开关
+    bool enable_ego_comp    = false;  // 是否启用自车运动补偿
+};
+
+// ─── 多目标跟踪器（接口对齐 AB3DMOT）────────────────────────────
 class Tracker {
 public:
     explicit Tracker(const TrackerConfig& cfg = TrackerConfig{});
     ~Tracker() = default;
 
     /**
-     * 更新跟踪器（每帧调用一次）
-     * @param detections  当帧 BEV 检测结果列表
-     * @param timestamp   当前帧时间戳（秒）
-     * @return            所有确认轨迹（state == Active 或 Lost）
+     * 每帧更新（核心方法）
+     * @param detections  当前帧检测结果（BEV 坐标系）
+     * @param timestamp   时间戳（秒），用于预测和补偿
+     * @return            确认的轨迹列表（is_confirmed() == true）
      */
     std::vector<Track> update(const std::vector<Detection>& detections,
-                              double timestamp = 0.0);
-
-    /**
-     * 获取当前所有有效轨迹（不更新状态）
-     */
-    const std::vector<Track>& tracks() const { return tracks_; }
+                              double timestamp);
 
     /**
      * 重置跟踪器（清空所有轨迹）
      */
     void reset();
 
-    int  next_id() const { return static_cast<int>(next_id_); }
+    const std::vector<Track>& tracks() const { return tracks_; }
+    int next_id() const { return static_cast<int>(next_id_); }
+
+private:
+    // ── 数据关联子步骤 ──────────────────────────────────────
+    struct MatchResult {
+        std::vector<std::pair<int,int>> matches;         // (det_idx, trk_idx)
+        std::vector<int> unmatched_dets;
+        std::vector<int> unmatched_trks;
+        std::vector<float> costs;                        // 匹配成功的代价
+        std::vector<std::vector<float>> affinity;        // 原始代价/相似度矩阵
+    };
+
+    // 构建代价矩阵（支持不同 metric）
+    std::vector<std::vector<float>> buildCostMatrix(
+        const std::vector<Detection>& dets,
+        const std::vector<Track>& trks) const;
+    
+    // GIoU 3D 计算
+    float computeGiou3D(const Track& trk, const Detection& det) const;
+
+    // 辅助函数：计算两个 BEV 旋转矩形的 I_2D 和 C_2D（面积）
+    void computeBEVIntersectionAndConvexArea(float cx1, float cy1, float l1, float w1, float yaw1,
+                                             float cx2, float cy2, float l2, float w2, float yaw2,
+                                             float& I_2D, float& C_2D) const;
+
+    // 执行匹配（匈牙利或贪心）
+    MatchResult dataAssociation(
+        const std::vector<Detection>& dets,
+        const std::vector<Track>& trks,
+        const std::vector<std::vector<float>>& cost) const;
+
+    // 贪心匹配（当前 hungarian_match 实现）
+    std::vector<std::pair<int,int>> greedyMatch(
+        const std::vector<std::vector<float>>& cost,
+        float max_cost) const;
+
+    // 匈牙利匹配（后续实现，目前只声明）
+    std::vector<std::pair<int,int>> hungarianMatch(
+        const std::vector<std::vector<float>>& cost,
+        float max_cost) const;
+
+    // 自车运动补偿（预留接口）
+    void egoMotionCompensation(
+        std::vector<Track>& trks,
+        double timestamp) const;   // 具体实现待添加
+
+    // 更新匹配的轨迹（含卡尔曼更新）
+    void updateMatchedTracks(
+        const std::vector<std::pair<int,int>>& matches,
+        const std::vector<Detection>& dets,
+        double timestamp);
+
+    // 创建新轨迹（birth）
+    void createNewTracks(
+        const std::vector<int>& unmatched_det_indices,
+        const std::vector<Detection>& dets,
+        double timestamp);
+
+    // 删除过期轨迹并返回确认轨迹
+    std::vector<Track> outputConfirmedTracks();
 
 private:
     TrackerConfig cfg_;
-    uint64_t      next_id_ = 1;
+    uint64_t next_id_ = 1;
     std::vector<Track> tracks_;
-
-    // 匈牙利算法（最小代价匹配）
-    // cost[i][j] = 轨迹 i 与检测 j 的距离，超出阈值视为不可匹配
-    static std::vector<std::pair<int,int>> hungarian_match(
-        const std::vector<std::vector<float>>& cost,
-        float max_cost);
 };
 
 }  // namespace tracking

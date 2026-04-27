@@ -66,10 +66,11 @@ struct CameraFrame {
     // 几何张量：由 nuscenes_adapter 或 camera 模块预计算
     // valid_c_idx: [NUM_CAMERAS, num_voxels] float32
     // valid_x/y:   [NUM_CAMERAS, num_voxels] int64
-    const float*   valid_c_idx = nullptr;  // 外部管理
-    const int64_t* valid_x     = nullptr;
-    const int64_t* valid_y     = nullptr;
-    int            num_voxels  = 160000;
+    float*   valid_c_idx = nullptr;  // 非 const：FrameLoader 可持有所有权
+    int64_t* valid_x     = nullptr;
+    int64_t* valid_y     = nullptr;
+    int      num_voxels  = 160000;
+    bool     owns_tensors = false;   // true = FrameLoader 分配，free_frame() 负责释放
 
     // 来自哪个数据源（调试用）
     std::string source_tag;

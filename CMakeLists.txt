@@ -73,6 +73,7 @@ include_directories(
   ${SPCONV_ROOT}/include
   src/common
   src/
+  src/tracking
 )
 
 link_directories(
@@ -88,6 +89,10 @@ file(GLOB_RECURSE CORE_FILES
   src/fastbev/*.cpp
   src/common/tensor.cu
   src/common/tensorrt.cpp
+  src/common/stb_image_impl.cpp
+  src/camera/camera_frame.cpp
+  src/pipeline/perception_pipeline.cpp
+  src/tracking/tracker.cpp
 )
 
 file(GLOB_RECURSE VISUALIZE_FILES 
@@ -128,7 +133,6 @@ target_link_libraries(fastbev
   ${OpenCV_LIBS}
 )
 #######################################################################
-
 
 ########################## libpybev.so ################################
 if(${CMAKE_BUILD_PYTHON} STREQUAL "ON")
