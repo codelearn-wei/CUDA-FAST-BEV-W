@@ -405,6 +405,74 @@ def render_bev_detections(
     return legend_counts
 
 
+# ── 地图元素颜色 ──────────────────────────────────────────────────────────────
+_MAP_COLORS = {
+    "divider":     (0, 220, 220),    # 青色  — 车道/道路分隔线
+    "ped_crossing":(80, 120, 255),   # 蓝色  — 人行横道
+    "boundary":    (140, 200, 90),   # 绿色  — 道路边界
+}
+_MAP_ALPHA_FILL = 0.25   # polygon 填充透明度
+_MAP_LINE_THICKNESS = 2
+
+
+def render_map_overlay(
+    canvas: np.ndarray,
+    map_elements: list,
+    bounds,
+    bev_size: int,
+    ego_yaw_global: float = None,
+    bev_mode: str = "world",
+) -> None:
+    """
+    将地图元素（来自 map_result.json）叠加到 BEV 画布上（原地修改）。
+
+    地图元素坐标系：x=right, y=forward（与 FastBEV 检测结果相同）
+    绘制顺序：boundary → ped_crossing → divider（由底到顶）。
+    """
+    if not map_elements:
+        return
+
+    # 按类型分组，决定绘制顺序
+    order = ["boundary", "ped_crossing", "divider"]
+    by_type: dict = {t: [] for t in order}
+    for elem in map_elements:
+        t = elem.get("type", "boundary")
+        if t in by_type:
+            by_type[t].append(elem)
+        else:
+            by_type.setdefault(t, []).append(elem)
+
+    for t in order + [k for k in by_type if k not in order]:
+        for elem in by_type.get(t, []):
+            pts_local = np.array(elem.get("points", []), dtype=np.float32)
+            if len(pts_local) < 2:
+                continue
+
+            # 坐标变换（与检测结果相同的流程）
+            if bev_mode == "world" and ego_yaw_global is not None:
+                pts_disp = transform_model_local_to_world_relative(
+                    pts_local, float(ego_yaw_global))
+            else:
+                pts_disp = model_local_to_display(pts_local)
+
+            pts_canvas = metric_to_canvas(pts_disp, bounds, bev_size)  # [N, 2]
+            color = _MAP_COLORS.get(t, (160, 160, 160))
+
+            if elem.get("is_polygon", False) and len(pts_canvas) >= 3:
+                # 多边形半透明填充
+                overlay = canvas.copy()
+                cv2.fillPoly(overlay, [pts_canvas], color)
+                canvas[:] = alpha_blend(canvas, overlay, _MAP_ALPHA_FILL)
+                cv2.polylines(canvas, [pts_canvas], isClosed=True,
+                              color=color, thickness=_MAP_LINE_THICKNESS,
+                              lineType=cv2.LINE_AA)
+            else:
+                # 折线
+                cv2.polylines(canvas, [pts_canvas], isClosed=False,
+                              color=color, thickness=_MAP_LINE_THICKNESS,
+                              lineType=cv2.LINE_AA)
+
+
 def render_bev_panel(detections: list, bounds, bev_size: int,
                      ego_speed_mps: float = 0.0,
                      ego_yaw_global: float = None,
@@ -412,12 +480,21 @@ def render_bev_panel(detections: list, bounds, bev_size: int,
                      ego_motion_yaw_global: float = None,
                      ego_speed_forward_mps: float = None,
                      bev_mode: str = "world",
-                     show_labels: bool = False) -> np.ndarray:
-    """生成完整 BEV 检测结果面板（含背景、检测框、图例、自车信息）。"""
+                     show_labels: bool = False,
+                     map_elements: list = None) -> np.ndarray:
+    """生成完整 BEV 检测结果面板（含背景、地图叠加、检测框、图例、自车信息）。"""
     canvas = render_bev_background(
         bounds, bev_size,
         ego_yaw_global=display_yaw_global,
         bev_mode=bev_mode)
+
+    # 地图叠加（绘在检测框之前，避免遮挡）
+    if map_elements:
+        render_map_overlay(
+            canvas, map_elements, bounds, bev_size,
+            ego_yaw_global=display_yaw_global,
+            bev_mode=bev_mode)
+
     legend = render_bev_detections(
         canvas, detections, bounds, bev_size,
         ego_yaw_global=display_yaw_global,
@@ -764,6 +841,8 @@ def parse_args():
                    help="禁用速度合理性过滤")
     p.add_argument("--bev-nms-dist",   type=float, default=0.8,
                    help="BEV 中心距离 NMS 阈值（米），0=禁用，默认 0.8")
+    p.add_argument("--no-map",          action="store_true",
+                   help="禁用地图叠加（即使 map_result.json 存在也不显示）")
     return p.parse_args()
 
 
@@ -909,7 +988,19 @@ def main():
                 + math.radians(args.ego_heading_offset_deg)
             )
 
-        # ── 2. 渲染 BEV 面板（含自车速度/朝向）──
+        # ── 2. 读取地图元素（若存在）──
+        map_elements = None
+        if not getattr(args, 'no_map', False):
+            map_json = frame_dir / "map_result.json"
+            if map_json.exists():
+                try:
+                    with open(map_json) as _mf:
+                        _mr = json.load(_mf)
+                    map_elements = _mr.get("elements", [])
+                except Exception:
+                    map_elements = None
+
+        # ── 3. 渲染 BEV 面板（含自车速度/朝向/地图）──
         bev_panel = render_bev_panel(
             detections, BEV_BOUNDS, args.bev_size,
             ego_speed_mps=ego_speed_mps,
@@ -918,15 +1009,16 @@ def main():
             ego_motion_yaw_global=ego_motion_yaw_global,
             ego_speed_forward_mps=ego_forward_speed_mps,
             bev_mode=args.bev_mode,
-            show_labels=args.show_labels)
+            show_labels=args.show_labels,
+            map_elements=map_elements)
 
-        # ── 3. 组合相机网格（含 3D 框投影）──
+        # ── 4. 组合相机网格（含 3D 框投影）──
         cam_grid = compose_camera_grid(frame_dir, detections, args.cam_width)
         cam_h = cam_grid.shape[0]
         bev_resized = cv2.resize(bev_panel, (int(bev_panel.shape[1] * cam_h / bev_panel.shape[0]), cam_h))
         combined = np.concatenate([cam_grid, bev_resized], axis=1)
 
-        # ── 4. 添加信息栏（含 ego 速度/朝向）──
+        # ── 5. 添加信息栏（含 ego 速度/朝向）──
         info_bar = compose_info_bar(
             render_idx + 1, len(frame_dirs),
             len(detections), combined.shape[1],
@@ -936,7 +1028,7 @@ def main():
             ego_forward_speed_mps=ego_forward_speed_mps)
         frame_out = np.concatenate([combined, info_bar], axis=0)
 
-        # ── 5. 初始化视频写入器 ──
+        # ── 6. 初始化视频写入器 ──
         if video_writer is None:
             h, w = frame_out.shape[:2]
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -945,7 +1037,7 @@ def main():
 
         video_writer.write(frame_out)
 
-        # ── 6. 可选保存帧图像 ──
+        # ── 7. 可选保存帧图像 ──
         if args.save_frames:
             frame_img_path = out_dir / "frames" / f"{render_idx:05d}.jpg"
             cv2.imwrite(str(frame_img_path), frame_out)

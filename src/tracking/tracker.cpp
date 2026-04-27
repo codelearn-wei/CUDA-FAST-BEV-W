@@ -13,13 +13,12 @@ namespace tracking {
 
 // ─── 辅助转换：距离度量阈值处理（Python 中对距离取负）─────────────
 static float normalizeThreshold(float thres, MetricType metric) {
-    if (metric == MetricType::DIST_3D || 
-        metric == MetricType::MAHALANOBIS) {
-        // 距离越小越好，阈值应为负数（例如 thres = -3.0）
-        return -(std::abs(thres));
-    } else {
-        // IoU/GIoU 阈值直接使用（范围 [-1,1]）
-        return thres;
+    if (metric == MetricType::DIST_3D) {
+        return std::abs(thres);     // 欧氏距离越小越好 → 代价取负
+    } else if (metric == MetricType::MAHALANOBIS) {
+        return std::abs(thres);       // 马氏距离越小越好，阈值直接为正
+    } else { // GIOU_3D, IOU_3D
+        return thres;                 // IoU/GIoU 阈值原样
     }
 }
 
@@ -60,9 +59,12 @@ std::vector<std::vector<float>> Tracker::buildCostMatrix(
                     break;
                 }
                 case MetricType::MAHALANOBIS: {
-                    // TODO: 实现 computeMahalanobis（需卡尔曼协方差）
-                    // val = computeMahalanobis(trks[i], dets[j]);
-                    val = 1e9f;
+                    // 仅当轨迹在上一帧被更新过（协方差有效）时才计算马氏距离
+                    if (trks[i].time_since_update == 0) {
+                        val = trks[i].mahalanobisToDetection(dets[j]);
+                    } else {
+                        val = 1e9f;   // 无效匹配
+                    }
                     break;
                 }
                 default:

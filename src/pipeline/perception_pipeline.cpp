@@ -24,7 +24,7 @@ PerceptionPipeline::PerceptionPipeline(const PipelineConfig& cfg)
         tracking::TrackerConfig tc;
         tc.max_dist        = cfg_.track_max_dist;
         tc.max_lost_frames = cfg_.track_max_lost;
-        tc.min_hits_confirm= cfg_.track_min_hits;
+        tc.min_hits = cfg_.track_min_hits;
         tc.dt              = cfg_.track_dt;
         tracker_ = std::make_unique<tracking::Tracker>(tc);
     }
