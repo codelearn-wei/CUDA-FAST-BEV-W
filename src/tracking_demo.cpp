@@ -393,7 +393,7 @@ int main(int argc, char** argv) {
 
     int total_boxes = 0;
     double timestamp = 0.0;
-    double fps = 6.0;   // 可以根据实际帧率调整，或从数据中读取
+    double fps = 10.0;   // 可以根据实际帧率调整，或从数据中读取
 
     for (const auto& fdir : frame_dirs) {
       std::string data_root = resolve_data_root(fdir);
@@ -431,17 +431,19 @@ int main(int argc, char** argv) {
       // ========== tracking：将检测框转换为跟踪模块需要的 Detection 格式 ==========
       std::vector<fastbev::tracking::Detection> detections;
       for (const auto& box : boxes) {
-        fastbev::tracking::Detection det;
-        // 根据你的 tracking 模块实际定义赋值（请参考 track.hpp / tracker.hpp）
-        det.position = {box.position.x, box.position.y, box.position.z};
-        det.size     = {box.size.w, box.size.l, box.size.h};
-        det.yaw      = box.z_rotation;
-        det.label    = box.id;
-        det.score    = box.score;
-        det.velocity = {box.velocity.vx, box.velocity.vy};
-        // 如果 Detection 需要 timestamp，则添加
-        // det.timestamp = timestamp;
-        detections.push_back(det);
+          fastbev::tracking::Detection det;
+          det.x      = box.position.x;
+          det.y      = box.position.y;
+          det.z      = box.position.z;
+          det.w      = box.size.w;
+          det.l      = box.size.l;
+          det.h      = box.size.h;
+          det.yaw    = box.z_rotation;
+          det.vx     = box.velocity.vx;
+          det.vy     = box.velocity.vy;
+          det.score  = box.score;
+          det.class_id = box.id;          // 注意：Detection 中是 class_id，不是 label
+          detections.push_back(det);
       }
 
       // 更新跟踪器，得到轨迹
@@ -452,18 +454,23 @@ int main(int argc, char** argv) {
 
       // 为每一帧保存轨迹到单独文件（例如 result_tracks.json）
       if (cfg.output_format == "json") {
-        std::string track_path = fdir + "/tracks.json";
-        std::ofstream ofs(track_path);
-        // 简单输出，实际应按 JSON 格式
-        ofs << "[\n";
-        for (size_t i = 0; i < tracks.size(); ++i) {
-          const auto& trk = tracks[i];
-          ofs << "  {\"track_id\": " << trk.id << ", \"position\": [" 
-              << trk.position.x << "," << trk.position.y << "," << trk.position.z << "]}\n";
-          if (i != tracks.size()-1) ofs << ",";
-        }
-        ofs << "]\n";
-        ofs.close();
+          std::string track_path = fdir + "/tracks.json";
+          std::ofstream ofs(track_path);
+          ofs << "[\n";
+          for (size_t i = 0; i < tracks.size(); ++i) {
+              const auto& trk = tracks[i];
+              ofs << "  {"
+                  << "\"track_id\": " << trk.track_id << ", "
+                  << "\"position\": [" << trk.x << ", " << trk.y << ", " << trk.z << "], "
+                  << "\"size\": [" << trk.w << ", " << trk.l << ", " << trk.h << "], "
+                  << "\"yaw\": " << trk.yaw << ", "
+                  << "\"velocity\": [" << trk.vx << ", " << trk.vy << "]"
+                  << "}";
+              if (i != tracks.size() - 1) ofs << ",";
+              ofs << "\n";
+          }
+          ofs << "]\n";
+          ofs.close();
       }
 
       timestamp += 1.0 / fps;

@@ -1,9 +1,3 @@
-1. 当前开发不要修改tracking部分，目前有人在开发这一部分，后续我需要使用分支融合代码，避免冲突。
-2. 目前已经完成单帧的检测，nusences数据集的适配，以及可视化，目前需要完成其他部分的整体开发。
-3. 当前单帧目标检测和基于nusences的目标检测还是有一些不准，针对一些对象还会出现一些位置上的偏移。请你从数据输入，模型推理等层次去检测代码是否有什么问题，能提升效果。如果能提升就保留，不能提升还是使用原来的逻辑。
-4.需要建立一个规则用一些指标如置信度，类别等显式的对于目标检测的物体进行滤除，以提升项目的可用性。一定要保证接口的方便，且能适配整个实时推理-检测-跟踪-输出的pipeline。 
-5. 适配多路相机图像输入，反复调试，保证在当前相机输入能够适配BEV算法的输入接口
-
 # CUDA-FastBEV — 高性能纯视觉 BEV 3D 目标检测
 
 基于 NVIDIA TensorRT 的 [FastBEV](https://github.com/Sense-GVT/Fast-BEV) 纯相机 BEV 感知推理框架。支持 NuScenes 原始数据、多帧视频可视化、多目标跟踪接口及 ROS Noetic 实时接口。
@@ -79,6 +73,8 @@ unzip nuScenes-example-data.zip
 ```bash
 # 修改 TensorRT/CUDA 路径后激活
 source tool/environment.sh
+# 配置推理所需要的环境
+bash tools/maptr/setup_maptr_env.sh
 ```
 
 ### 3. 编译 TRT 引擎 + C++ 程序
@@ -200,6 +196,67 @@ python tools/video_demo.py
 
 ---
 
+## Step 4 · MapTRv2 HD 地图模块
+
+MapTRv2 模块独立运行，可与 FastBEV 感知**并行**，将道路元素叠加到 BEV 视图中。详见 [tools/maptr/README.md](tools/maptr/README.md)。
+
+### 三模式地图提取
+
+| 模式 | 触发条件 | 数据来源 | `source` 字段 |
+|------|----------|----------|--------------|
+| **模型推理**（最高精度）| `maptr` env + checkpoint 可用 | MapTRv2 神经网络 | `"model"` |
+| **GT**（精确）| `maps/expansion/*.json` 存在 | NuScenes Map Expansion | `"gt"` |
+| **轨迹降级**（始终可用）| 任意情况均可 | `meta.json` ego 轨迹 | `"trajectory"` |
+
+### 快速使用（GT 模式）
+
+```bash
+conda activate bev
+
+# GT 模式：使用 NuScenes Map Expansion JSON
+python tools/maptr/run_maptr.py \
+    --frames-dir outputs/frames \
+    --nuscenes-dir data/nuscenes \
+    --mode gt --overwrite --verify
+
+# 生成含地图叠加的视频（map_result.json 自动被 video_demo.py 读取）
+python tools/video_demo.py 
+    --frames-dir outputs/frames 
+    --out-dir outputs/video 
+    --fps 6 --bev-size 800 --score-thr 0.3
+```
+
+GT 模式需要 NuScenes map expansion 数据：
+- PNG basemap：`data/nuscenes/maps/basemap/*.png`（v1.0-mini 自带，需在 `maps/` 下创建 symlinks）
+- 矢量地图：`data/nuscenes/maps/expansion/*.json`（从 [NuScenes 官网](https://www.nuscenes.org/nuscenes#download) 下载 Map expansion 包）
+
+### MapTRv2 神经网络推理（可选）
+
+```bash
+# 1. 安装 maptr conda 环境（仅第一次）
+bash tools/maptr/setup_maptr_env.sh
+
+# 2. 检查环境状态
+conda run -n bev python tools/maptr/run_maptr.py --check-model
+
+# 3. 运行神经网络推理（与 FastBEV 可并行）
+conda run -n bev python tools/maptr/run_maptr.py 
+    --frames-dir outputs/frames 
+    --mode model --score-thr 0.3 --overwrite
+```
+
+### BEV 地图可视化颜色约定
+
+| 颜色 | 元素类型 | 说明 |
+|------|---------|------|
+| 青色（0, 220, 220）| `divider` | 车道分隔线 / 中心线 |
+| 绿色（140, 200, 90）| `boundary` | 道路边界 |
+| 蓝色（80, 120, 255）| `ped_crossing` | 人行横道 |
+
+加 `--no-map` 参数可禁用地图叠加。
+
+---
+
 ## 多目标跟踪（Tracking 模块）
 
 跟踪模块位于 `src/tracking/`，提供与 BEV 检测解耦的目标跟踪接口。详见 [src/tracking/README.md](src/tracking/README.md)。
@@ -277,9 +334,13 @@ python tools/nuscenes_adapter.py \
 ./build/fastbev outputs/frames resnet18int8 int8 \
     --score-thr 0.3 --output-format json --batch --no-warmup
 
-# 3. 生成可视化视频
-python tools/video_demo.py \
-    --frames-dir outputs/frames --out-dir outputs/video \
+# 3. HD 地图提取（与推理并行运行，互不依赖）
+python tools/maptr/run_maptr.py 
+    --frames-dir outputs/frames --mode gt --overwrite
+
+# 4. 生成可视化视频（含检测框 + 地图叠加）
+python tools/video_demo.py 
+    --frames-dir outputs/frames --out-dir outputs/video 
     --score-thr 0.25 --fps 4
 # 结果: outputs/video/fastbev_demo.mp4
 ```
@@ -305,7 +366,8 @@ python ptq/export_onnx.py  # 导出 ONNX
 | 模块 | 路径 | 说明 |
 |------|------|------|
 | 数据适配 | [tools/nuscenes_adapter.py](tools/nuscenes_adapter.py) | NuScenes 原始数据 → 帧目录 |
-| 视频可视化 | [tools/video_demo.py](tools/video_demo.py) | 多帧 BEV+相机视频 |
+| 视频可视化 | [tools/video_demo.py](tools/video_demo.py) | 多帧 BEV+相机视频（含地图叠加）|
+| **HD 地图模块** | [tools/maptr/](tools/maptr/) | **[README](tools/maptr/README.md)** — GT + 轨迹双模式 |
 | 多目标跟踪 | [src/tracking/](src/tracking/) | [README](src/tracking/README.md) |
 | 相机管理 | [src/camera/](src/camera/) | [README](src/camera/README.md) |
 | 感知管线 | [src/pipeline/](src/pipeline/) | [README](src/pipeline/README.md) |

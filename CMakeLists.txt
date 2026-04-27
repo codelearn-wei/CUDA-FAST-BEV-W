@@ -6,7 +6,16 @@ set(CMAKE_BUILD_PYTHON $ENV{USE_Python})
 set(CMAKE_BUILD_TYPE "Release")
 # set(CMAKE_BUILD_TYPE "Debug")
 set(arch ${CMAKE_HOST_SYSTEM_PROCESSOR})
-
+# ---------- 添加 Eigen3 查找 ----------
+find_package(Eigen3 REQUIRED)
+if(EIGEN3_FOUND)
+    message(STATUS "Eigen3 found at ${EIGEN3_INCLUDE_DIRS}")
+else()
+    set(EIGEN3_INCLUDE_DIRS "/usr/include/eigen3")
+    if(NOT EXISTS "${EIGEN3_INCLUDE_DIRS}/Eigen/Dense")
+        message(FATAL_ERROR "Eigen3 not found. Please install libeigen3-dev")
+    endif()
+endif()
 
 find_package(CUDA REQUIRED)
 find_package(Protobuf REQUIRED)
@@ -74,6 +83,7 @@ include_directories(
   src/common
   src/
   src/tracking
+  ${EIGEN3_INCLUDE_DIRS}
 )
 
 link_directories(
@@ -93,6 +103,7 @@ file(GLOB_RECURSE CORE_FILES
   src/camera/camera_frame.cpp
   src/pipeline/perception_pipeline.cpp
   src/tracking/tracker.cpp
+  src/tracking/KalmanFilter.cpp
 )
 
 file(GLOB_RECURSE VISUALIZE_FILES 
@@ -119,12 +130,28 @@ target_link_libraries(fastbev_core
 
 
 ####################### fastbev program #############################
-cuda_add_executable(fastbev 
-  src/main.cpp
-  ${VISUALIZE_FILES}
+# cuda_add_executable(fastbev 
+#   src/main.cpp
+#   ${VISUALIZE_FILES}
+# )
+
+# target_link_libraries(fastbev
+#   fastbev_core
+#   libnvinfer.so
+#   libspconv.so
+#   ${Protobuf_LIBRARIES}
+#   libnvinfer_plugin.so
+#   ${OpenCV_LIBS}
+# )
+#######################################################################
+
+####################### tracking_demo #############################
+cuda_add_executable(tracking_demo
+  src/tracking_demo.cpp   # 假设 tracking_demo.cpp 位于 src/ 下
+  ${VISUALIZE_FILES}      # 如果需要可视化
 )
 
-target_link_libraries(fastbev
+target_link_libraries(tracking_demo
   fastbev_core
   libnvinfer.so
   libspconv.so
