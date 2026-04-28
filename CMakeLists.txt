@@ -130,19 +130,19 @@ target_link_libraries(fastbev_core
 
 
 ####################### fastbev program #############################
-# cuda_add_executable(fastbev 
-#   src/main.cpp
-#   ${VISUALIZE_FILES}
-# )
+cuda_add_executable(fastbev 
+  src/main.cpp
+  ${VISUALIZE_FILES}
+)
 
-# target_link_libraries(fastbev
-#   fastbev_core
-#   libnvinfer.so
-#   libspconv.so
-#   ${Protobuf_LIBRARIES}
-#   libnvinfer_plugin.so
-#   ${OpenCV_LIBS}
-# )
+target_link_libraries(fastbev
+  fastbev_core
+  libnvinfer.so
+  libspconv.so
+  ${Protobuf_LIBRARIES}
+  libnvinfer_plugin.so
+  ${OpenCV_LIBS}
+)
 #######################################################################
 
 ####################### tracking_demo #############################
@@ -162,7 +162,7 @@ target_link_libraries(tracking_demo
 #######################################################################
 
 ########################## libpybev.so ################################
-if(${CMAKE_BUILD_PYTHON} STREQUAL "ON")
+if("${CMAKE_BUILD_PYTHON}" STREQUAL "ON")
   cuda_add_library(pybev SHARED
     src/python.cpp
   )

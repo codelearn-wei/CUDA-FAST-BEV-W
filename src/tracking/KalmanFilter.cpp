@@ -27,6 +27,7 @@ KalmanFilter::KalmanFilter() {
 
     // 过程噪声 Q：只对速度有微小扰动
     Q_ = Eigen::MatrixXd::Zero(dim_x, dim_x);
+    Q_(3, 3) = 0.1;
     for (int i = 7; i < dim_x; ++i) {
         Q_(i, i) = 0.01;            // 与 python 代码一致
     }
@@ -57,15 +58,17 @@ void KalmanFilter::predict(double dt) {
 void KalmanFilter::update(const Eigen::VectorXd& z) {
     // 创新
     Eigen::VectorXd y = z - H_ * x_;
+    // 【关键】对角度残差归一化到 [-π, π)
+    y(3) = normalizeAngle(y(3));
+    
     Eigen::MatrixXd S = H_ * P_ * H_.transpose() + R_;
     Eigen::MatrixXd K = P_ * H_.transpose() * S.inverse();
 
     // 更新状态
     x_ = x_ + K * y;
-    // 更新协方差（标准公式）
     P_ = (Eigen::MatrixXd::Identity(dim_x, dim_x) - K * H_) * P_;
 
-    // 角度归一化
+    // 角度归一化（保证最终状态角度在范围内）
     x_(3) = normalizeAngle(x_(3));
 }
 

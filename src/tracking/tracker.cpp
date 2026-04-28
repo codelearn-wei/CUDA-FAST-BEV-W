@@ -11,18 +11,21 @@
 namespace fastbev {
 namespace tracking {
 
-// ─── 辅助转换：距离度量阈值处理（Python 中对距离取负）─────────────
+// ─── 辅助转换：距离度量阈值处理 ─────────────────────────────────
 static float normalizeThreshold(float thres, MetricType metric) {
     if (metric == MetricType::DIST_3D) {
-        return std::abs(thres);     // 欧氏距离越小越好 → 代价取负
+        return std::abs(thres);
     } else if (metric == MetricType::MAHALANOBIS) {
-        return std::abs(thres);       // 马氏距离越小越好，阈值直接为正
-    } else { // GIOU_3D, IOU_3D
-        return thres;                 // IoU/GIoU 阈值原样
+        return std::abs(thres);
+    } else if (metric == MetricType::GIOU_3D) {
+        // Python 原始阈值是 giou 下界，转换为代价阈值 = 1 - thres
+        return 1.0f - thres;   // 例如 thres=-0.4 → 1.4
+    } else { // IOU_3D
+        return thres;
     }
 }
 
-// ─── 构建代价矩阵（支持 DIST_3D, GIOU_3D，其余预留）─────────────────
+// ─── 构建代价矩阵（支持 DIST_3D, GIOU_3D）────────────────────────
 std::vector<std::vector<float>> Tracker::buildCostMatrix(
     const std::vector<Detection>& dets,
     const std::vector<Track>& trks) const
@@ -33,40 +36,20 @@ std::vector<std::vector<float>> Tracker::buildCostMatrix(
 
     for (int i = 0; i < n_trk; ++i) {
         for (int j = 0; j < n_det; ++j) {
-            // 类别过滤（可配置是否严格相同，此处保持严格匹配）
             if (trks[i].class_id != dets[j].class_id) continue;
 
             float val = 0.0f;
             switch (cfg_.metric) {
                 case MetricType::DIST_3D:
-                    // 3D 中心欧氏距离（需要在 Track 类中实现 dist3d）
                     val = trks[i].dist3d(dets[j]);
                     break;
-
                 case MetricType::GIOU_3D: {
-                    // 计算 GIoU 3D，代价 = 1 - GIoU
                     float giou = computeGiou3D(trks[i], dets[j]);
-                    val = 1.0f - giou;   // 范围 [0,2]，越小表示匹配越好
+                    val = 1.0f - giou;
                     break;
                 }
-
-                // 以下为预留分支，尚未实现，返回极大值表示不可匹配
-                case MetricType::IOU_3D: {
-                    // TODO: 实现 computeIou3D
-                    // float iou = computeIou3D(trks[i], dets[j]);
-                    // val = 1.0f - iou;
-                    val = 1e9f;
-                    break;
-                }
-                case MetricType::MAHALANOBIS: {
-                    // 仅当轨迹在上一帧被更新过（协方差有效）时才计算马氏距离
-                    if (trks[i].time_since_update == 0) {
-                        val = trks[i].mahalanobisToDetection(dets[j]);
-                    } else {
-                        val = 1e9f;   // 无效匹配
-                    }
-                    break;
-                }
+                case MetricType::IOU_3D:
+                case MetricType::MAHALANOBIS:
                 default:
                     val = 1e9f;
                     break;
@@ -77,14 +60,14 @@ std::vector<std::vector<float>> Tracker::buildCostMatrix(
     return cost;
 }
 
+// ─── BEV 辅助计算（不变）────────────────────────────────────────
 void Tracker::computeBEVIntersectionAndConvexArea(
     float cx1, float cy1, float l1, float w1, float yaw1,
     float cx2, float cy2, float l2, float w2, float yaw2,
     float& I_2D, float& C_2D) const
 {
-    // 将弧度转为度数（OpenCV 使用度数）
-    double angle1 = yaw1 * 180.0 / M_PI;
-    double angle2 = yaw2 * 180.0 / M_PI;
+    double angle1 = -yaw1 * 180.0 / M_PI;
+    double angle2 = -yaw2 * 180.0 / M_PI;
 
     cv::RotatedRect rect1(cv::Point2f(cx1, cy1), cv::Size2f(l1, w1), angle1);
     cv::RotatedRect rect2(cv::Point2f(cx2, cy2), cv::Size2f(l2, w2), angle2);
@@ -111,9 +94,9 @@ void Tracker::computeBEVIntersectionAndConvexArea(
     C_2D = cv::contourArea(convex_hull);
 }
 
+// ─── GIoU 3D（不变）─────────────────────────────────────────────
 float Tracker::computeGiou3D(const Track& trk, const Detection& det) const
 {
-    // 获取参数（根据你的数据结构，确保成员名正确）
     float cx1 = trk.x, cy1 = trk.y, cz1 = trk.z;
     float l1 = trk.l, w1 = trk.w, h1 = trk.h;
     float yaw1 = trk.yaw;
@@ -122,13 +105,11 @@ float Tracker::computeGiou3D(const Track& trk, const Detection& det) const
     float l2 = det.l, w2 = det.w, h2 = det.h;
     float yaw2 = det.yaw;
 
-    // BEV 投影
     float I_2D = 0.0f, C_2D = 0.0f;
     computeBEVIntersectionAndConvexArea(cx1, cy1, l1, w1, yaw1,
                                         cx2, cy2, l2, w2, yaw2,
                                         I_2D, C_2D);
 
-    // 高度方向
     float zmin1 = cz1 - h1 / 2.0f;
     float zmax1 = cz1 + h1 / 2.0f;
     float zmin2 = cz2 - h2 / 2.0f;
@@ -149,21 +130,20 @@ float Tracker::computeGiou3D(const Track& trk, const Detection& det) const
     return giou_3d;
 }
 
-// ─── 贪心匹配（保留原有代码）──────────────────────────────────────
+// ─── 贪心匹配（全矩阵，不预过滤）────────────────────────────────
 std::vector<std::pair<int,int>> Tracker::greedyMatch(
-    const std::vector<std::vector<float>>& cost,
-    float max_cost) const
+    const std::vector<std::vector<float>>& cost) const   // 移除 max_cost
 {
     int n_rows = static_cast<int>(cost.size());
     if (n_rows == 0) return {};
     int n_cols = static_cast<int>(cost[0].size());
 
-    struct Item { float c; int r, c_; };
+    struct Item { float c; int r; int c_; };
     std::vector<Item> items;
+    items.reserve(n_rows * n_cols);
     for (int i = 0; i < n_rows; ++i)
         for (int j = 0; j < n_cols; ++j)
-            if (cost[i][j] <= max_cost)
-                items.push_back({cost[i][j], i, j});
+            items.push_back({cost[i][j], i, j});
 
     std::sort(items.begin(), items.end(),
               [](const Item& a, const Item& b) { return a.c < b.c; });
@@ -181,63 +161,71 @@ std::vector<std::pair<int,int>> Tracker::greedyMatch(
     return matches;
 }
 
-// ─── 匈牙利匹配（仅声明，后续实现）─────────────────────────────────
+// ─── 匈牙利匹配（全矩阵，暂用贪心替代，可替换为真实匈牙利）────────
 std::vector<std::pair<int,int>> Tracker::hungarianMatch(
-    const std::vector<std::vector<float>>& /*cost*/,
-    float /*max_cost*/) const
+    const std::vector<std::vector<float>>& cost) const   // 移除 max_cost
 {
-    // TODO: 实现标准匈牙利算法（可调用外部库，如 dlib/hungarian）
-    return {};
+    // TODO: 实现标准匈牙利算法
+    // 这里暂时调用贪心以保证功能
+    return greedyMatch(cost);
 }
 
-// ─── 数据关联入口 ────────────────────────────────────────────────
+// ─── 数据关联入口（先全匹配，再阈值过滤）────────────────────────
 Tracker::MatchResult Tracker::dataAssociation(
     const std::vector<Detection>& dets,
     const std::vector<Track>& trks,
     const std::vector<std::vector<float>>& cost) const
 {
     float thr = normalizeThreshold(cfg_.threshold, cfg_.metric);
-
-    std::vector<std::pair<int,int>> matches;
-    if (cfg_.algo == AlgoType::HUNGARIAN) {
-        matches = hungarianMatch(cost, thr);
-    } else { // GREEDY
-        matches = greedyMatch(cost, thr);
+    
+    std::vector<std::pair<int,int>> raw_matches;
+    if (cfg_.algo == AlgoType::HUNGARIAN) raw_matches = hungarianMatch(cost);
+    else raw_matches = greedyMatch(cost);
+    
+    // 统计 raw_matches 的代价
+    float min_cost = 1e9, max_cost = -1e9;
+    for (const auto& m : raw_matches) {
+        float c = cost[m.first][m.second];
+        if (c < min_cost) min_cost = c;
+        if (c > max_cost) max_cost = c;
     }
-
-    // 标记已匹配
+    printf("[dataAssoc] raw_matches=%zu, cost[%.2f, %.2f], thr=%.2f\n",
+           raw_matches.size(), min_cost, max_cost, thr);
+    
+    // 阈值过滤
     std::vector<bool> trk_matched(trks.size(), false);
     std::vector<bool> det_matched(dets.size(), false);
-    for (const auto& m : matches) {
-        trk_matched[m.first] = true;
-        det_matched[m.second] = true;
+    std::vector<std::pair<int,int>> final_matches;
+    for (const auto& m : raw_matches) {
+        float c = cost[m.first][m.second];
+        if (c <= thr) {
+            final_matches.push_back(m);
+            trk_matched[m.first] = true;
+            det_matched[m.second] = true;
+        }
     }
-
+    
     // 收集未匹配
     std::vector<int> unmatched_trks, unmatched_dets;
     for (size_t i = 0; i < trks.size(); ++i)
         if (!trk_matched[i]) unmatched_trks.push_back(i);
     for (size_t j = 0; j < dets.size(); ++j)
         if (!det_matched[j]) unmatched_dets.push_back(j);
-
-    // 收集匹配的代价
-    std::vector<float> match_costs;
-    for (const auto& m : matches)
-        match_costs.push_back(cost[m.first][m.second]);
-
-    // affinity 可以返回原始 cost 矩阵（可选）
-    return {matches, unmatched_dets, unmatched_trks, match_costs, cost};
+    
+    printf("[dataAssoc] final_matches=%zu, unmatched_dets=%zu, unmatched_trks=%zu\n",
+           final_matches.size(), unmatched_dets.size(), unmatched_trks.size());
+    
+    return {final_matches, unmatched_dets, unmatched_trks, {}, cost};
 }
 
-// ─── 自车运动补偿（空实现，仅框架）─────────────────────────────────
+// ─── 自车运动补偿（占位）────────────────────────────────────────
 void Tracker::egoMotionCompensation(std::vector<Track>& /*trks*/,
                                     double /*timestamp*/) const
 {
-    // TODO: 根据 cfg_.enable_ego_comp 实现
-    // 需要外部提供 pose 查询接口
+    // TODO: 实现自车运动补偿
 }
 
-// ─── 更新已匹配的轨迹 ────────────────────────────────────────────
+// ─── 更新已匹配的轨迹 ──────────────────────────────────────────
 void Tracker::updateMatchedTracks(
     const std::vector<std::pair<int,int>>& matches,
     const std::vector<Detection>& dets,
@@ -247,17 +235,13 @@ void Tracker::updateMatchedTracks(
         int trk_idx = m.first;
         int det_idx = m.second;
         Track& trk = tracks_[trk_idx];
-        // 更新统计
         trk.time_since_update = 0;
         trk.hits++;
-        // 调用 Track 的更新方法（目前是简单低通，后续可替换为卡尔曼）
         trk.update(dets[det_idx], timestamp);
-        // 可选：保存 info（如置信度）
-        // trk.info = info[det_idx];
     }
 }
 
-// ─── 创建新轨迹（birth）─────────────────────────────────────────
+// ─── 创建新轨迹（birth）────────────────────────────────────────
 void Tracker::createNewTracks(
     const std::vector<int>& unmatched_det_indices,
     const std::vector<Detection>& dets,
@@ -268,27 +252,24 @@ void Tracker::createNewTracks(
     }
 }
 
-// ─── 输出确认的轨迹（过滤 min_hits / max_age）─────────────────────
+// ─── 输出确认的轨迹（过滤 min_hits / max_age）───────────────────
 std::vector<Track> Tracker::outputConfirmedTracks()
 {
     std::vector<Track> keep;
     keep.reserve(tracks_.size());
     for (auto& trk : tracks_) {
         if (trk.state == TrackState::Removed) continue;
-        // 移除超时轨迹
         if (trk.time_since_update > cfg_.max_lost_frames) {
             trk.state = TrackState::Removed;
             continue;
         }
-        // 保留未超时轨迹（包括未确认的）
         keep.push_back(trk);
     }
     tracks_ = std::move(keep);
 
-    // 返回确认的轨迹
     std::vector<Track> confirmed;
     for (const auto& trk : tracks_) {
-        if (trk.is_confirmed())   // is_confirmed() 内部检查 hits >= min_hits? 实际上需结合 cfg_.min_hits
+        if (trk.is_confirmed())
             confirmed.push_back(trk);
     }
     return confirmed;
@@ -302,35 +283,44 @@ void Tracker::reset() {
     next_id_ = 1;
 }
 
-// ─── 核心更新函数（完全对齐 AB3DMOT 流程）─────────────────────────
+// ─── 核心更新函数 ──────────────────────────────────────────────
 std::vector<Track> Tracker::update(const std::vector<Detection>& detections,
                                    double timestamp)
 {
-    // 1. 预测所有现有轨迹（匀速模型或卡尔曼）
-    for (auto& trk : tracks_) {
-        trk.predict(cfg_.dt);
+    // 1. 复制并归一化检测框的 yaw
+    std::vector<Detection> norm_dets = detections;
+    for (auto& det : norm_dets) {
+        float orig = det.yaw;
+        det.yaw = KalmanFilter::normalizeAngle(det.yaw);
+        if (std::abs(orig - det.yaw) > 0.01) {
+            printf("[Tracker] yaw normalized: %.4f -> %.4f\n", orig, det.yaw);
+        }
     }
-
-    // 2. 自车运动补偿（可选）
+    
+    // 2. 使用正确的预测步长（从配置中获取）
+    double dt = cfg_.dt;
+    for (auto& trk : tracks_) {
+        trk.predict(dt);
+    }
+    
+    // 3. 自车运动补偿（可选）
     if (cfg_.enable_ego_comp) {
-        // 注意：补偿应该在预测之后，匹配之前，将轨迹变换到当前坐标系
-        // 由于 tracks_ 是当前成员，直接传递引用
         egoMotionCompensation(tracks_, timestamp);
     }
-
-    // 3. 构建代价矩阵
-    auto cost = buildCostMatrix(detections, tracks_);
-
-    // 4. 数据关联（匈牙利/贪心）
-    auto matchRes = dataAssociation(detections, tracks_, cost);
-
-    // 5. 更新匹配的轨迹
-    updateMatchedTracks(matchRes.matches, detections, timestamp);
-
-    // 6. 创建新轨迹（birth）
-    createNewTracks(matchRes.unmatched_dets, detections, timestamp);
-
-    // 7. 输出确认轨迹（根据 min_hits 和 max_age）
+    
+    // 4. 构建代价矩阵（使用归一化后的 norm_dets）
+    auto cost = buildCostMatrix(norm_dets, tracks_);
+    
+    // 5. 数据关联（使用归一化后的检测）
+    auto matchRes = dataAssociation(norm_dets, tracks_, cost);
+    
+    // 6. 更新匹配的轨迹
+    updateMatchedTracks(matchRes.matches, norm_dets, timestamp);
+    
+    // 7. 创建新轨迹（使用归一化后的检测）
+    createNewTracks(matchRes.unmatched_dets, norm_dets, timestamp);
+    
+    // 8. 输出确认轨迹
     return outputConfirmedTracks();
 }
 
