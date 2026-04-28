@@ -39,7 +39,15 @@ struct TrackerConfig {
     float      threshold    = 0.5f;   // 统一阈值（距离取负，IoU/GIoU 直接使用）
 
     // 功能开关
-    bool enable_ego_comp    = false;  // 是否启用自车运动补偿
+    bool enable_ego_comp    = true;   // 启用自车运动补偿（修复航向角跳变）
+};
+
+// ─── 自车全局位姿（用于 ego 运动补偿）──────────────────────────
+struct EgoPose {
+    double x    = 0.0;    // 全局 x（米）
+    double y    = 0.0;    // 全局 y（米）
+    double yaw  = 0.0;    // 全局航向角（弧度）
+    bool   valid = false; // 是否有效
 };
 
 // ─── 多目标跟踪器（接口对齐 AB3DMOT）────────────────────────────
@@ -50,12 +58,14 @@ public:
 
     /**
      * 每帧更新（核心方法）
-     * @param detections  当前帧检测结果（BEV 坐标系）
-     * @param timestamp   时间戳（秒），用于预测和补偿
-     * @return            确认的轨迹列表（is_confirmed() == true）
+     * @param detections    当前帧检测结果（lidar-local 坐标系）
+     * @param timestamp     时间戳（秒），用于预测和补偿
+     * @param current_ego   当前帧自车全局位姿（用于 ego 运动补偿）
+     * @return              确认的轨迹列表（is_confirmed() == true）
      */
     std::vector<Track> update(const std::vector<Detection>& detections,
-                              double timestamp);
+                              double timestamp,
+                              const EgoPose& current_ego = EgoPose{});
 
     /**
      * 重置跟踪器（清空所有轨迹）
@@ -101,10 +111,11 @@ private:
     std::vector<std::pair<int,int>> hungarianMatch(
         const std::vector<std::vector<float>>& cost) const;
 
-    // 自车运动补偿（预留接口）
+    // 自车运动补偿：将所有轨迹预测状态从上一帧local坐标转到当前帧local坐标
     void egoMotionCompensation(
         std::vector<Track>& trks,
-        double timestamp) const;   // 具体实现待添加
+        const EgoPose& prev_ego,
+        const EgoPose& curr_ego) const;
 
     // 更新匹配的轨迹（含卡尔曼更新）
     void updateMatchedTracks(
@@ -125,6 +136,7 @@ private:
     TrackerConfig cfg_;
     uint64_t next_id_ = 1;
     std::vector<Track> tracks_;
+    EgoPose prev_ego_pose_;   // 上一帧自车全局位姿（用于运动补偿）
 };
 
 }  // namespace tracking

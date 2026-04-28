@@ -34,9 +34,21 @@ std::vector<std::vector<float>> Tracker::buildCostMatrix(
     const int n_det = static_cast<int>(dets.size());
     std::vector<std::vector<float>> cost(n_trk, std::vector<float>(n_det, 1e9f));
 
+    const float max_angle_diff = 60.0f * M_PI / 180.0f;
+
     for (int i = 0; i < n_trk; ++i) {
         for (int j = 0; j < n_det; ++j) {
             if (trks[i].class_id != dets[j].class_id) continue;
+
+            // 计算最小夹角差
+            float yaw_trk = trks[i].yaw;
+            float yaw_det = dets[j].yaw;
+            float diff = std::abs(yaw_trk - yaw_det);
+            diff = std::min(diff, 2.0f * static_cast<float>(M_PI) - diff);
+            if (diff > max_angle_diff) {
+                // 朝向相差超过90°，禁止匹配
+                continue;
+            }
 
             float val = 0.0f;
             switch (cfg_.metric) {
@@ -189,9 +201,6 @@ Tracker::MatchResult Tracker::dataAssociation(
         if (c < min_cost) min_cost = c;
         if (c > max_cost) max_cost = c;
     }
-    printf("[dataAssoc] raw_matches=%zu, cost[%.2f, %.2f], thr=%.2f\n",
-           raw_matches.size(), min_cost, max_cost, thr);
-    
     // 阈值过滤
     std::vector<bool> trk_matched(trks.size(), false);
     std::vector<bool> det_matched(dets.size(), false);
@@ -212,17 +221,25 @@ Tracker::MatchResult Tracker::dataAssociation(
     for (size_t j = 0; j < dets.size(); ++j)
         if (!det_matched[j]) unmatched_dets.push_back(j);
     
-    printf("[dataAssoc] final_matches=%zu, unmatched_dets=%zu, unmatched_trks=%zu\n",
-           final_matches.size(), unmatched_dets.size(), unmatched_trks.size());
-    
     return {final_matches, unmatched_dets, unmatched_trks, {}, cost};
 }
 
-// ─── 自车运动补偿（占位）────────────────────────────────────────
-void Tracker::egoMotionCompensation(std::vector<Track>& /*trks*/,
-                                    double /*timestamp*/) const
+// ─── 自车运动补偿（核心实现）──────────────────────────────────
+void Tracker::egoMotionCompensation(
+    std::vector<Track>& trks,
+    const EgoPose& prev_ego,
+    const EgoPose& curr_ego) const
 {
-    // TODO: 实现自车运动补偿
+    // 将每个轨迹的预测状态从 prev_ego 坐标系变换到 curr_ego 坐标系
+    for (auto& trk : trks) {
+        trk.applyEgoMotionTransform(
+            prev_ego.x, prev_ego.y, prev_ego.yaw,
+            curr_ego.x, curr_ego.y, curr_ego.yaw);
+    }
+    printf("[EgoComp] 补偿: prev_yaw=%.3f, curr_yaw=%.3f, delta_yaw=%.3f rad, "
+           "ego位移=(%.2f,%.2f)m\n",
+           prev_ego.yaw, curr_ego.yaw, prev_ego.yaw - curr_ego.yaw,
+           curr_ego.x - prev_ego.x, curr_ego.y - prev_ego.y);
 }
 
 // ─── 更新已匹配的轨迹 ──────────────────────────────────────────
@@ -285,16 +302,14 @@ void Tracker::reset() {
 
 // ─── 核心更新函数 ──────────────────────────────────────────────
 std::vector<Track> Tracker::update(const std::vector<Detection>& detections,
-                                   double timestamp)
+                                   double timestamp,
+                                   const EgoPose& current_ego)
 {
     // 1. 复制并归一化检测框的 yaw
     std::vector<Detection> norm_dets = detections;
     for (auto& det : norm_dets) {
         float orig = det.yaw;
         det.yaw = KalmanFilter::normalizeAngle(det.yaw);
-        if (std::abs(orig - det.yaw) > 0.01) {
-            printf("[Tracker] yaw normalized: %.4f -> %.4f\n", orig, det.yaw);
-        }
     }
     
     // 2. 使用正确的预测步长（从配置中获取）
@@ -303,21 +318,24 @@ std::vector<Track> Tracker::update(const std::vector<Detection>& detections,
         trk.predict(dt);
     }
     
-    // 3. 自车运动补偿（可选）
-    if (cfg_.enable_ego_comp) {
-        egoMotionCompensation(tracks_, timestamp);
+    // 3. 自车运动补偿：将预测后的轨迹状态从上一帧坐标系转到当前帧坐标系
+    if (cfg_.enable_ego_comp && current_ego.valid && prev_ego_pose_.valid) {
+        egoMotionCompensation(tracks_, prev_ego_pose_, current_ego);
     }
     
-    // 4. 构建代价矩阵（使用归一化后的 norm_dets）
-    auto cost = buildCostMatrix(norm_dets, tracks_);
+    // 4. 保存当前 ego 位姿为下一帧的上一帧位姿
+    if (current_ego.valid) {
+        prev_ego_pose_ = current_ego;
+    }
     
-    // 5. 数据关联（使用归一化后的检测）
+    // 5. 构建代价矩阵和数据关联
+    auto cost = buildCostMatrix(norm_dets, tracks_);
     auto matchRes = dataAssociation(norm_dets, tracks_, cost);
     
     // 6. 更新匹配的轨迹
     updateMatchedTracks(matchRes.matches, norm_dets, timestamp);
     
-    // 7. 创建新轨迹（使用归一化后的检测）
+    // 7. 创建新轨迹
     createNewTracks(matchRes.unmatched_dets, norm_dets, timestamp);
     
     // 8. 输出确认轨迹

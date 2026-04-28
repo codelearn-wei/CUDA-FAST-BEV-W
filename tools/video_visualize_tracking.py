@@ -10,6 +10,70 @@ import shutil
 import glob
 from collections import defaultdict
 
+# ─── 地图元素颜色（对应 MapElementType: 0=Divider, 1=Boundary, 2=PedCrossing）
+MAP_ELEM_COLORS = {0: '#00CFCF', 1: '#00C040', 2: '#4080FF'}
+MAP_ELEM_LABELS = {0: 'divider', 1: 'boundary', 2: 'ped_crossing'}
+
+
+def parse_joint_result_frames(frames_dir, swap_y_sign=True):
+    """
+    解析 joint_result.json（由 joint_inference --save-json 生成）。
+
+    返回:
+        tracking_data:  {frame_num: [(track_id, x, y, l, w, yaw), ...]}
+        detection_data: {frame_num: [(None,     x, y, l, w, yaw), ...]}
+        map_data:       {frame_num: [{'type_id': int, 'pts': [[x,y],...]},...]}
+
+    JSON 格式说明:
+        tracks[]    — position:[x,y,z], size:[w,l,h], yaw, track_id
+        detections[]— x,y,z, l,w,h, yaw  (flat)
+        map.elements— type:int(0/1/2), pts:[[x,y],...]
+    """
+    tracking_data  = defaultdict(list)
+    detection_data = defaultdict(list)
+    map_data       = defaultdict(list)
+
+    subdirs = sorted(
+        [d for d in os.listdir(frames_dir) if re.match(r'frame_\d+', d)],
+        key=lambda s: int(re.search(r'\d+', s).group()))
+
+    for subdir in subdirs:
+        frame_num = int(re.search(r'\d+', subdir).group())
+        jpath = os.path.join(frames_dir, subdir, 'joint_result.json')
+        if not os.path.exists(jpath):
+            continue
+        with open(jpath, 'r') as f:
+            jr = json.load(f)
+
+        for t in jr.get('tracks', []):
+            pos = t['position']
+            sz  = t['size']          # [w, l, h]
+            x, y = pos[0], pos[1]
+            w, l = sz[0], sz[1]
+            yaw  = t.get('yaw', 0.0)
+            if swap_y_sign:
+                y = -y; yaw = -yaw
+            tracking_data[frame_num].append((t['track_id'], x, y, l, w, yaw))
+
+        for d in jr.get('detections', []):
+            x, y = d.get('x', 0.0), d.get('y', 0.0)
+            l, w = d.get('l', 1.0), d.get('w', 1.0)
+            yaw  = d.get('yaw', 0.0)
+            if swap_y_sign:
+                y = -y; yaw = -yaw
+            detection_data[frame_num].append((None, x, y, l, w, yaw))
+
+        for elem in jr.get('map', {}).get('elements', []):
+            type_id = int(elem.get('type', 0))
+            pts_raw = elem.get('pts', [])
+            if len(pts_raw) >= 2:
+                pts = [[float(p[0]), float(p[1])] for p in pts_raw if len(p) >= 2]
+                if pts:
+                    map_data[frame_num].append({'type_id': type_id, 'pts': pts})
+
+    return tracking_data, detection_data, map_data
+
+
 def parse_tracking_json_frames(frames_dir, swap_y_sign=True):
     """解析 tracks.json（跟踪结果）"""
     frame_data = defaultdict(list)
@@ -33,8 +97,8 @@ def parse_tracking_json_frames(frames_dir, swap_y_sign=True):
             
             x = pos[0]
             y = pos[1]
-            l = size[0]   # 长度（前向）
-            w = size[1]   # 宽度（侧向）
+            w = size[0]   # 宽度（侧向）
+            l = size[1]   # 长度（前向）
             
             if swap_y_sign:
                 y = -y
@@ -123,9 +187,9 @@ def create_video_with_ffmpeg_simple(frame_pattern, output_video, fps=6, bitrate=
             width, height = map(int, result.stdout.strip().split('x'))
             width = round_to_even(width)
             height = round_to_even(height)
-            scale_filter = f"scale={width}:{height}"
+            scale_filter = f"scale={width}:{height},setsar=1"
         else:
-            scale_filter = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+            scale_filter = "scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1"
         cmd = [
             'ffmpeg', '-y',
             '-framerate', str(fps),
@@ -166,10 +230,17 @@ def create_video_with_ffmpeg_simple(frame_pattern, output_video, fps=6, bitrate=
         return False
 
 def visualize_tracking_from_json(frames_dir, output_video_path, fps=6, dpi=400, figsize=(16, 16),
-                                  swap_y_sign=True, swap_axes=True, bitrate="50M"):
+                                  swap_y_sign=True, swap_axes=True, bitrate="50M", xlim=None, ylim=None,
+                                  use_joint_result=False):
     # 解析跟踪结果和原始检测结果
-    tracking_data = parse_tracking_json_frames(frames_dir, swap_y_sign=swap_y_sign)
-    detection_data = parse_detection_json_frames(frames_dir, swap_y_sign=swap_y_sign)
+    if use_joint_result:
+        tracking_data, detection_data, map_data = parse_joint_result_frames(
+            frames_dir, swap_y_sign=swap_y_sign)
+        print("[joint 模式] 读取 joint_result.json（含地图元素）")
+    else:
+        tracking_data  = parse_tracking_json_frames(frames_dir, swap_y_sign=swap_y_sign)
+        detection_data = parse_detection_json_frames(frames_dir, swap_y_sign=swap_y_sign)
+        map_data       = {}
     
     if not tracking_data and not detection_data:
         print("No data found.")
@@ -179,41 +250,54 @@ def visualize_tracking_from_json(frames_dir, output_video_path, fps=6, dpi=400, 
     all_frames = sorted(set(tracking_data.keys()) | set(detection_data.keys()))
     print(f"Total frames: {len(all_frames)}")
 
-    # 收集坐标范围（同时考虑跟踪和检测框）
-    all_x = []
-    all_y = []
-    # 处理跟踪框
-    for frame_id in all_frames:
-        for (track_id, x, y, l, w, yaw) in tracking_data.get(frame_id, []):
-            corners = rotated_rectangle_vertices(x, y, l, w, yaw)
-            if swap_axes:
-                plot_corners = corners[:, [1, 0]]
-            else:
-                plot_corners = corners
-            all_x.extend(plot_corners[:, 0])
-            all_y.extend(plot_corners[:, 1])
-    # 处理检测框
-    for frame_id in all_frames:
-        for (_, x, y, l, w, yaw) in detection_data.get(frame_id, []):
-            corners = rotated_rectangle_vertices(x, y, l, w, yaw)
-            if swap_axes:
-                plot_corners = corners[:, [1, 0]]
-            else:
-                plot_corners = corners
-            all_x.extend(plot_corners[:, 0])
-            all_y.extend(plot_corners[:, 1])
+    if xlim is not None and ylim is not None:
+        # 完全手动指定
+        x_min, x_max = xlim[0], xlim[1]
+        y_min, y_max = ylim[0], ylim[1]
+    else:
+        # 至少有一个轴需要自动计算
+        all_x = []
+        all_y = []
+        # 处理跟踪框
+        for frame_id in all_frames:
+            for (track_id, x, y, l, w, yaw) in tracking_data.get(frame_id, []):
+                corners = rotated_rectangle_vertices(x, y, l, w, yaw)
+                if swap_axes:
+                    plot_corners = corners[:, [1, 0]]
+                else:
+                    plot_corners = corners
+                all_x.extend(plot_corners[:, 0])
+                all_y.extend(plot_corners[:, 1])
+        # 处理检测框
+        for frame_id in all_frames:
+            for (_, x, y, l, w, yaw) in detection_data.get(frame_id, []):
+                corners = rotated_rectangle_vertices(x, y, l, w, yaw)
+                if swap_axes:
+                    plot_corners = corners[:, [1, 0]]
+                else:
+                    plot_corners = corners
+                all_x.extend(plot_corners[:, 0])
+                all_y.extend(plot_corners[:, 1])
 
-    if not all_x:
-        return
-    
-    x_min, x_max = min(all_x), max(all_x)
-    y_min, y_max = min(all_y), max(all_y)
-    margin_x = max(1.0, (x_max - x_min) * 0.1)
-    margin_y = max(1.0, (y_max - y_min) * 0.1)
-    x_min -= margin_x
-    x_max += margin_x
-    y_min -= margin_y
-    y_max += margin_y
+        if not all_x:
+            return
+
+        # 自动计算范围（可能只计算其中一个轴，如果另一个已手动指定）
+        if xlim is None:
+            x_min, x_max = min(all_x), max(all_x)
+            margin_x = max(1.0, (x_max - x_min) * 0.1)
+            x_min -= margin_x
+            x_max += margin_x
+        else:
+            x_min, x_max = xlim[0], xlim[1]
+
+        if ylim is None:
+            y_min, y_max = min(all_y), max(all_y)
+            margin_y = max(1.0, (y_max - y_min) * 0.1)
+            y_min -= margin_y
+            y_max += margin_y
+        else:
+            y_min, y_max = ylim[0], ylim[1]
 
     temp_dir = os.path.join(os.path.dirname(output_video_path), "temp_frames")
     os.makedirs(temp_dir, exist_ok=True)
@@ -263,7 +347,20 @@ def visualize_tracking_from_json(frames_dir, output_video_path, fps=6, dpi=400, 
                                    linewidth=1.0, alpha=0.3, linestyle='--')
             ax.add_patch(poly)
 
-        # 2. 绘制跟踪结果（彩色实心+ID）
+        # 2. 绘制地图元素（仅 joint 模式有数据）
+        # type: 0=divider(青), 1=boundary(绿), 2=ped_crossing(蓝)
+        for elem in map_data.get(frame_id, []):
+            type_id = elem['type_id']
+            pts = np.array(elem['pts'], dtype=np.float64)
+            color = MAP_ELEM_COLORS.get(type_id, '#FF8800')
+            if swap_axes:
+                plot_pts = pts[:, [1, 0]]
+            else:
+                plot_pts = pts
+            ax.plot(plot_pts[:, 0], plot_pts[:, 1],
+                    color=color, linewidth=2.0, alpha=0.85, solid_capstyle='round')
+
+        # 3. 绘制跟踪结果（彩色实心+ID）
         for (track_id, x, y, l, w, yaw) in tracking_data.get(frame_id, []):
             corners = rotated_rectangle_vertices(x, y, l, w, yaw)
             if swap_axes:
@@ -281,14 +378,14 @@ def visualize_tracking_from_json(frames_dir, output_video_path, fps=6, dpi=400, 
             else:
                 text_x, text_y = x, y
             
-            ax.text(text_x, text_y, str(track_id), ha='center', va='center',
-                    fontsize=5, color='white', weight='bold',
-                    bbox=dict(facecolor='black', alpha=0.7, boxstyle='round,pad=0.2'))
+            # ax.text(text_x, text_y, str(track_id), ha='center', va='center',
+            #         fontsize=5, color='white', weight='bold',
+            #         bbox=dict(facecolor='black', alpha=0.7, boxstyle='round,pad=0.2'))
 
         ax.grid(True, linestyle='--', alpha=0.5)
         frame_filename = os.path.join(temp_dir, f"frame_{idx:06d}.png")
-        plt.savefig(frame_filename, dpi=dpi, bbox_inches='tight', pad_inches=0.1,
-                   facecolor='white', edgecolor='none')
+        # 固定 figsize 保存，避免 bbox_inches='tight' 导致 FFmpeg scale 变形
+        fig.savefig(frame_filename, dpi=dpi, facecolor='white', edgecolor='none')
         plt.close(fig)
 
     print(f"\nAll PNG frames saved. Total: {len(all_frames)}")
@@ -306,23 +403,52 @@ def visualize_tracking_from_json(frames_dir, output_video_path, fps=6, dpi=400, 
     print("Done!")
 
 if __name__ == "__main__":
+    import argparse as _ap
+    _p = _ap.ArgumentParser(description="Tracking 可视化 — 将 tracks.json / joint_result.json 渲染为 BEV 视频")
+    _p.add_argument("--frames-dir", type=str, default=None,
+                    help="包含 frame_* 子目录的帧数据根目录（默认: outputs/frames）")
+    _p.add_argument("--out-video",  type=str, default=None,
+                    help="输出视频路径（默认: outputs/tracking_result.mp4）")
+    _p.add_argument("--joint",      action="store_true",
+                    help="读取 joint_result.json（含 BEV tracks + 地图元素），替代默认的 tracks.json")
+    _p.add_argument("--fps",        type=int, default=6)
+    _p.add_argument("--dpi",        type=int, default=500,
+                    help="渲染 DPI（越大越清晰但越慢，默认 200）")
+    _p.add_argument("--figsize",    type=int, default=6,
+                    help="图像尺寸（正方形，默认 12 英寸）")
+    _p.add_argument("--bitrate",    type=str, default="10M")
+    _p.add_argument("--xlim",       type=float, nargs=2, metavar=('MIN','MAX'), default=[-40.0, 40.0],
+                    help="手动设置 X 轴范围（例如 --xlim -30 30），若不指定则自动计算")
+    _p.add_argument("--ylim",       type=float, nargs=2, metavar=('MIN','MAX'), default=[-40.0, 40.0],
+                    help="手动设置 Y 轴范围")
+    _a = _p.parse_args()
+
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    frames_directory = os.path.abspath(os.path.join(script_dir, "../outputs/frames"))
-    output_directory = os.path.abspath(os.path.join(script_dir, "../outputs"))
-    os.makedirs(output_directory, exist_ok=True)
-    
-    output_video = os.path.join(output_directory, "tracking_result.mp4")
-    
+    if _a.frames_dir:
+        frames_directory = os.path.abspath(_a.frames_dir)
+    else:
+        frames_directory = os.path.abspath(os.path.join(script_dir, "../outputs/frames"))
+    if _a.out_video:
+        output_video = os.path.abspath(_a.out_video)
+    else:
+        output_directory = os.path.abspath(os.path.join(script_dir, "../outputs"))
+        os.makedirs(output_directory, exist_ok=True)
+        output_video = os.path.join(output_directory, "tracking_result.mp4")
+
     if not os.path.exists(frames_directory):
         print(f"Directory not found: {frames_directory}")
     else:
+        os.makedirs(os.path.dirname(os.path.abspath(output_video)), exist_ok=True)
         visualize_tracking_from_json(
-            frames_directory, 
-            output_video, 
-            fps=6, 
-            dpi=400,
-            figsize=(12, 12),
-            swap_y_sign=False, 
+            frames_directory,
+            output_video,
+            fps=_a.fps,
+            dpi=_a.dpi,
+            figsize=(_a.figsize, _a.figsize),
+            swap_y_sign=False,
             swap_axes=True,
-            bitrate="10M"
+            bitrate=_a.bitrate,
+            xlim=_a.xlim,
+            ylim=_a.ylim,
+            use_joint_result=_a.joint,
         )

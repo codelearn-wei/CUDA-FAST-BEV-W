@@ -39,6 +39,14 @@ public:
     // 计算马氏距离（给定测量值 z）
     double mahalanobisDistance(const Eigen::VectorXd& z) const;
 
+    /**
+     * 自车运动补偿：将 KF 状态从上一帧 lidar-local 坐标系变换到当前帧 lidar-local 坐标系。
+     * 参数为上一帧和当前帧的全局位姿 (x, y, yaw)。
+     * 变换包含：位置旋转+平移、航向角偏置、速度旋转、协方差旋转。
+     */
+    void applyEgoTransform(double prev_ego_x, double prev_ego_y, double prev_ego_yaw,
+                           double curr_ego_x, double curr_ego_y, double curr_ego_yaw);
+
 private:
     Eigen::VectorXd x_;      // 状态 (10x1)
     Eigen::MatrixXd P_;      // 协方差 (10x10)

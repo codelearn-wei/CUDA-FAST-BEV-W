@@ -162,7 +162,8 @@ def compute_geometry_tensors(
 # ─── 从 example-data.pth 准备帧数据 ─────────────────────────────────────────
 
 def prepare_frame_from_pth(pth_path: str, out_dir: Path, frame_idx: int = 0,
-                           image_src_dir: str = None):
+                           image_src_dir: str = None,
+                           skip_geometry: bool = False):
     """
     从现有的 example-data.pth 准备帧目录（兼容旧格式）。
     """
@@ -184,11 +185,12 @@ def prepare_frame_from_pth(pth_path: str, out_dir: Path, frame_idx: int = 0,
     frame_dir.mkdir(parents=True, exist_ok=True)
 
     # 计算几何张量
-    valid_c_idx, valid_x, valid_y = compute_geometry_tensors(
-        extrinsics, intrinsic, origin)
-    save_tensor(valid_c_idx,  str(frame_dir / "valid_c_idx.tensor"))
-    save_tensor(valid_x,      str(frame_dir / "x.tensor"))
-    save_tensor(valid_y,      str(frame_dir / "y.tensor"))
+    if not skip_geometry:
+        valid_c_idx, valid_x, valid_y = compute_geometry_tensors(
+            extrinsics, intrinsic, origin)
+        save_tensor(valid_c_idx,  str(frame_dir / "valid_c_idx.tensor"))
+        save_tensor(valid_x,      str(frame_dir / "x.tensor"))
+        save_tensor(valid_y,      str(frame_dir / "y.tensor"))
 
     # 复制图像
     camera_names = ["FRONT", "FRONT_RIGHT", "FRONT_LEFT", "BACK", "BACK_LEFT", "BACK_RIGHT"]
@@ -239,6 +241,7 @@ def prepare_frames_from_nuscenes_pkl(
     image_height: int = 900,
     output_width: int = 704,
     output_height: int = 256,
+    skip_geometry: bool = False,
 ):
     """
     从 NuScenes 格式的 pkl 文件批量准备帧目录。
@@ -395,11 +398,12 @@ def _prepare_single_nuscenes_info(
     origin_default = np.array([0.0, 0.0, -1.0], dtype=np.float64)
     origin = origin_default
 
-    valid_c_idx, valid_x, valid_y = compute_geometry_tensors(
-        extrinsics, intrinsic, origin)
-    save_tensor(valid_c_idx, str(frame_dir / "valid_c_idx.tensor"))
-    save_tensor(valid_x,     str(frame_dir / "x.tensor"))
-    save_tensor(valid_y,     str(frame_dir / "y.tensor"))
+    if not skip_geometry:
+        valid_c_idx, valid_x, valid_y = compute_geometry_tensors(
+            extrinsics, intrinsic, origin)
+        save_tensor(valid_c_idx, str(frame_dir / "valid_c_idx.tensor"))
+        save_tensor(valid_x,     str(frame_dir / "x.tensor"))
+        save_tensor(valid_y,     str(frame_dir / "y.tensor"))
 
     # ── 保存帧元信息 ──────────────────────────────────────────────────────
     meta = {
@@ -407,6 +411,7 @@ def _prepare_single_nuscenes_info(
         "sample_token": info.get("token", ""),
         "timestamp":    info.get("timestamp", 0),
         "origin":       origin.tolist(),
+        "geometry_precomputed": not skip_geometry,
         "camera_names": [name_to_short[c] for c in camera_order],
         "camera_paths": {
             name_to_short[cam_name]: str(frame_dir / f"{ci}-{name_to_short[cam_name]}.jpg")
@@ -449,6 +454,7 @@ def prepare_frames_from_nuscenes_raw(
     output_width: int = 704,
     output_height: int = 256,
     scene_names: list = None,
+    skip_geometry: bool = False,
 ) -> list:
     """
     从原始 NuScenes 数据集目录（包含 v1.0-mini/ 等 JSON 文件和 samples/ 目录）
@@ -644,15 +650,16 @@ def prepare_frames_from_nuscenes_raw(
             # fallback
             intrinsic = np.array([[1266.4, 0, 816.3], [0, 1266.4, 491.5], [0, 0, 1]])
 
-        # ── 计算几何张量 ──────────────────────────────────────────────────
-        # 每个相机独立使用自己的内参计算投影
         origin = np.array([0.0, 0.0, -1.0], dtype=np.float64)
-        valid_c_idx, valid_x, valid_y = compute_geometry_tensors_per_cam(
-            extrinsics, intrinsics_all, origin)
+        if not skip_geometry:
+            # ── 计算几何张量 ──────────────────────────────────────────────
+            # 每个相机独立使用自己的内参计算投影
+            valid_c_idx, valid_x, valid_y = compute_geometry_tensors_per_cam(
+                extrinsics, intrinsics_all, origin)
 
-        save_tensor(valid_c_idx, str(frame_dir / "valid_c_idx.tensor"))
-        save_tensor(valid_x,     str(frame_dir / "x.tensor"))
-        save_tensor(valid_y,     str(frame_dir / "y.tensor"))
+            save_tensor(valid_c_idx, str(frame_dir / "valid_c_idx.tensor"))
+            save_tensor(valid_x,     str(frame_dir / "x.tensor"))
+            save_tensor(valid_y,     str(frame_dir / "y.tensor"))
 
         # ── 获取 ego pose（自车全局位姿） ──────────────────────────────────
         ego_translation_global = [0.0, 0.0, 0.0]
@@ -674,6 +681,7 @@ def prepare_frames_from_nuscenes_raw(
             "sample_token": stok,
             "timestamp":    sample.get("timestamp", 0),
             "origin":       origin.tolist(),
+            "geometry_precomputed": not skip_geometry,
             "camera_names": [name_to_short[c] for c in camera_order],
             # 自车全局位姿（用于计算速度、显示朝向）
             "ego_translation_global": ego_translation_global,
@@ -783,6 +791,8 @@ def parse_args():
                    help="帧间隔")
     p.add_argument("--image-src-dir", type=str, default=None,
                    help="（pth 模式）图像文件目录")
+    p.add_argument("--skip-geometry", action="store_true",
+                   help="只导出图像和 meta.json，不预先计算 valid_c_idx/x/y 几何张量")
     return p.parse_args()
 
 
@@ -798,6 +808,7 @@ def main():
             out_dir      = out_dir,
             frame_idx    = 0,
             image_src_dir= args.image_src_dir or str(Path(args.pth_path).parent),
+            skip_geometry= args.skip_geometry,
         )
     elif args.pkl_path:
         print(f"[NuScenes pkl 模式] 从 {args.pkl_path} 准备 {args.num_frames} 帧")
@@ -808,6 +819,7 @@ def main():
             start_idx     = args.start_idx,
             num_frames    = args.num_frames,
             stride        = args.stride,
+            skip_geometry = args.skip_geometry,
         )
     else:
         scene_names = None
@@ -823,6 +835,7 @@ def main():
             num_frames    = args.num_frames,
             stride        = args.stride,
             scene_names   = scene_names,
+            skip_geometry = args.skip_geometry,
         )
     print("完成！")
 
