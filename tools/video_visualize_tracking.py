@@ -5,27 +5,21 @@ import cv2
 import os
 import json
 import re
+import subprocess
+import shutil
+import glob
 from collections import defaultdict
 
-def parse_json_frames(frames_dir, swap_y_sign=True):
-    """
-    解析 frames 目录下的所有 tracks.json 文件
-    返回 frame_data: dict {frame_index: [(track_id, x, y, l, w, yaw), ...]}
-    其中 x 为前向坐标，y 为侧向坐标，l 为长度，w 为宽度，yaw 为偏航角（弧度）
-    """
+def parse_tracking_json_frames(frames_dir, swap_y_sign=True):
+    """解析 tracks.json（跟踪结果）"""
     frame_data = defaultdict(list)
-    
-    # 获取所有子文件夹，匹配 frame_xxxxx 模式
     subdirs = [d for d in os.listdir(frames_dir) if re.match(r'frame_\d+', d)]
-    # 按数字排序
     subdirs.sort(key=lambda s: int(re.search(r'\d+', s).group()))
     
     for subdir in subdirs:
-        # 提取帧序号
         frame_num = int(re.search(r'\d+', subdir).group())
         json_path = os.path.join(frames_dir, subdir, 'tracks.json')
         if not os.path.exists(json_path):
-            print(f"Warning: {json_path} not found, skip")
             continue
         
         with open(json_path, 'r') as f:
@@ -33,14 +27,14 @@ def parse_json_frames(frames_dir, swap_y_sign=True):
         
         for track in tracks:
             track_id = track['track_id']
-            pos = track['position']        # [x, y, z]
-            size = track['size']           # [l, w, h]
+            pos = track['position']
+            size = track['size']
             yaw = track['yaw']
             
             x = pos[0]
             y = pos[1]
-            l = size[0]    # 长度（前向）
-            w = size[1]    # 宽度（侧向）
+            l = size[0]   # 长度（前向）
+            w = size[1]   # 宽度（侧向）
             
             if swap_y_sign:
                 y = -y
@@ -50,8 +44,44 @@ def parse_json_frames(frames_dir, swap_y_sign=True):
     
     return frame_data
 
+def parse_detection_json_frames(frames_dir, swap_y_sign=True):
+    """解析 result.json（原始检测结果）"""
+    frame_data = defaultdict(list)
+    subdirs = [d for d in os.listdir(frames_dir) if re.match(r'frame_\d+', d)]
+    subdirs.sort(key=lambda s: int(re.search(r'\d+', s).group()))
+    
+    for subdir in subdirs:
+        frame_num = int(re.search(r'\d+', subdir).group())
+        json_path = os.path.join(frames_dir, subdir, 'result.json')
+        if not os.path.exists(json_path):
+            continue
+        
+        with open(json_path, 'r') as f:
+            detections = json.load(f)
+        
+        for det in detections:
+            # result.json 中字段: center_xyz, size_xyz, yaw, score, label...
+            center = det.get('center_xyz')
+            size = det.get('size_xyz')
+            yaw = det.get('yaw')
+            if center is None or size is None or yaw is None:
+                continue
+            
+            x, y, z = center
+            # size_xyz 顺序为 [宽度, 长度, 高度]（与跟踪结果一致）
+            l = size[1]   # 长度（前向）
+            w = size[0]   # 宽度（侧向）
+            
+            if swap_y_sign:
+                y = -y
+                yaw = -yaw
+            
+            # 检测结果没有 track_id，用 None 占位
+            frame_data[frame_num].append((None, x, y, l, w, yaw))
+    
+    return frame_data
+
 def rotated_rectangle_vertices(cx, cy, len_x, len_y, angle_rad):
-    """返回矩形四个顶点坐标（原始坐标系）"""
     half_x = len_x / 2.0
     half_y = len_y / 2.0
     corners_local = np.array([
@@ -72,32 +102,102 @@ def get_color_for_id(track_id, cmap_name='tab20'):
     cmap = plt.get_cmap(cmap_name)
     return cmap((track_id * 13) % 20)
 
-def visualize_tracking_from_json(frames_dir, output_video_path, fps=6, dpi=100, figsize=(10, 10),
-                                  swap_y_sign=True, swap_axes=True):
-    """
-    可视化跟踪结果（BEV图），从 frames_dir 读取每帧的 tracks.json
-    swap_axes: 若为 True，则水平轴显示侧向 Y，垂直轴显示前向 X（即 X 上下显示）
-    """
-    # 解析所有帧数据
-    frame_data = parse_json_frames(frames_dir, swap_y_sign=swap_y_sign)
-    if not frame_data:
-        print("No valid data found.")
+def round_to_even(number):
+    return int(np.ceil(number / 2) * 2)
+
+def create_video_with_ffmpeg_simple(frame_pattern, output_video, fps=6, bitrate="50M"):
+    # 保持不变，略...
+    try:
+        frames = sorted(glob.glob(frame_pattern.replace('%06d', '*')))
+        if not frames:
+            print("No frames found!")
+            return False
+        first_frame = frames[0]
+        probe_cmd = [
+            'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+            '-show_entries', 'stream=width,height', '-of', 'csv=p=0:s=x',
+            first_frame
+        ]
+        result = subprocess.run(probe_cmd, capture_output=True, text=True)
+        if result.returncode == 0 and 'x' in result.stdout:
+            width, height = map(int, result.stdout.strip().split('x'))
+            width = round_to_even(width)
+            height = round_to_even(height)
+            scale_filter = f"scale={width}:{height}"
+        else:
+            scale_filter = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+        cmd = [
+            'ffmpeg', '-y',
+            '-framerate', str(fps),
+            '-i', frame_pattern,
+            '-vf', scale_filter,
+            '-c:v', 'libx264',
+            '-preset', 'veryslow',
+            '-b:v', bitrate,
+            '-minrate', bitrate,
+            '-maxrate', bitrate,
+            '-bufsize', '10M',
+            '-x264-params', 'nal-hrd=cbr:force-cfr=1',
+            '-profile:v', 'high',
+            '-level', '5.1',
+            '-pix_fmt', 'yuv420p',
+            '-movflags', '+faststart',
+            output_video
+        ]
+        print(f"Running FFmpeg: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"FFmpeg error: {result.stderr}")
+            return False
+        verify_cmd = [
+            'ffprobe', '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=bit_rate',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            output_video
+        ]
+        verify_result = subprocess.run(verify_cmd, capture_output=True, text=True)
+        if verify_result.stdout.strip():
+            actual_bitrate = int(verify_result.stdout.strip()) / 1000000
+            print(f"✅ Video bitrate: {actual_bitrate:.2f} Mbps")
+        return True
+    except Exception as e:
+        print(f"Error: {e}")
+        return False
+
+def visualize_tracking_from_json(frames_dir, output_video_path, fps=6, dpi=400, figsize=(16, 16),
+                                  swap_y_sign=True, swap_axes=True, bitrate="50M"):
+    # 解析跟踪结果和原始检测结果
+    tracking_data = parse_tracking_json_frames(frames_dir, swap_y_sign=swap_y_sign)
+    detection_data = parse_detection_json_frames(frames_dir, swap_y_sign=swap_y_sign)
+    
+    if not tracking_data and not detection_data:
+        print("No data found.")
         return
 
-    frames = sorted(frame_data.keys())
-    print(f"Total frames: {len(frames)}")
+    # 合并所有帧索引（跟踪和检测的帧可能不完全一致）
+    all_frames = sorted(set(tracking_data.keys()) | set(detection_data.keys()))
+    print(f"Total frames: {len(all_frames)}")
 
-    # 收集坐标范围（基于旋转矩形的真实顶点，考虑交换轴）
-    all_x = []   # 绘图水平轴坐标
-    all_y = []   # 绘图垂直轴坐标
-    for frame_id in frames:
-        objects = frame_data[frame_id]
-        for (track_id, x, y, l, w, yaw) in objects:
-            # 计算原始坐标系下的四个顶点
+    # 收集坐标范围（同时考虑跟踪和检测框）
+    all_x = []
+    all_y = []
+    # 处理跟踪框
+    for frame_id in all_frames:
+        for (track_id, x, y, l, w, yaw) in tracking_data.get(frame_id, []):
             corners = rotated_rectangle_vertices(x, y, l, w, yaw)
             if swap_axes:
-                # 绘图坐标：水平 = 原始 y，垂直 = 原始 x
-                plot_corners = corners[:, [1, 0]]  # (y, x)
+                plot_corners = corners[:, [1, 0]]
+            else:
+                plot_corners = corners
+            all_x.extend(plot_corners[:, 0])
+            all_y.extend(plot_corners[:, 1])
+    # 处理检测框
+    for frame_id in all_frames:
+        for (_, x, y, l, w, yaw) in detection_data.get(frame_id, []):
+            corners = rotated_rectangle_vertices(x, y, l, w, yaw)
+            if swap_axes:
+                plot_corners = corners[:, [1, 0]]
             else:
                 plot_corners = corners
             all_x.extend(plot_corners[:, 0])
@@ -105,6 +205,7 @@ def visualize_tracking_from_json(frames_dir, output_video_path, fps=6, dpi=100, 
 
     if not all_x:
         return
+    
     x_min, x_max = min(all_x), max(all_x)
     y_min, y_max = min(all_y), max(all_y)
     margin_x = max(1.0, (x_max - x_min) * 0.1)
@@ -114,95 +215,114 @@ def visualize_tracking_from_json(frames_dir, output_video_path, fps=6, dpi=100, 
     y_min -= margin_y
     y_max += margin_y
 
-    # 创建临时图获取尺寸
-    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
-    ax.set_xlim(x_min, x_max)
-    ax.set_ylim(y_min, y_max)
-    ax.set_aspect('equal')
-    if swap_axes:
-        ax.set_xlabel('Y (right) [m]')
-        ax.set_ylabel('X (forward) [m]')
-    else:
-        ax.set_xlabel('X (forward) [m]')
-        ax.set_ylabel('Y (right) [m]')
-    ax.set_title('Tracking Results (BEV)')
-    plt.tight_layout()
-    fig.canvas.draw()
-    img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    img = img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-    h_img, w_img = img.shape[:2]
-    plt.close(fig)
+    temp_dir = os.path.join(os.path.dirname(output_video_path), "temp_frames")
+    os.makedirs(temp_dir, exist_ok=True)
+    print(f"Saving temporary PNG frames to: {temp_dir}")
 
-    # 视频写入器
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    video_writer = cv2.VideoWriter(output_video_path, fourcc, fps, (w_img, h_img))
+    plt.rcParams['figure.dpi'] = dpi
+    plt.rcParams['savefig.dpi'] = dpi
+    plt.rcParams['font.family'] = 'sans-serif'
+    plt.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans']
+    plt.rcParams['font.size'] = 10
 
-    # 逐帧绘制
-    for idx, frame_id in enumerate(frames):
-        print(f"Rendering frame {idx+1}/{len(frames)} (frame_id={frame_id})", end='\r')
-        fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+    fig_width, fig_height = figsize
+    pixel_width = int(fig_width * dpi)
+    pixel_height = int(fig_height * dpi)
+    pixel_width = round_to_even(pixel_width)
+    pixel_height = round_to_even(pixel_height)
+    adjusted_figsize = (pixel_width / dpi, pixel_height / dpi)
+    
+    print(f"Resolution: {pixel_width}x{pixel_height}")
+    print(f"Target bitrate: {bitrate}")
+
+    for idx, frame_id in enumerate(all_frames):
+        print(f"Rendering frame {idx+1}/{len(all_frames)} (frame_id={frame_id})", end='\r')
+        fig, ax = plt.subplots(figsize=adjusted_figsize, dpi=dpi)
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(y_min, y_max)
         ax.set_aspect('equal')
+        
         if swap_axes:
-            ax.set_xlabel('Y (right) [m]')
-            ax.set_ylabel('X (forward) [m]')
+            ax.set_xlabel('Y (right) [m]', fontsize=12)
+            ax.set_ylabel('X (forward) [m]', fontsize=12)
         else:
-            ax.set_xlabel('X (forward) [m]')
-            ax.set_ylabel('Y (right) [m]')
-        ax.set_title(f'Frame {frame_id}')
+            ax.set_xlabel('X (forward) [m]', fontsize=12)
+            ax.set_ylabel('Y (right) [m]', fontsize=12)
+        
+        ax.set_title(f'Frame {frame_id}', fontsize=14)
 
-        objects = frame_data[frame_id]
-        for (track_id, x, y, l, w, yaw) in objects:
-            # 计算原始矩形顶点
+        # 1. 绘制原始检测框（灰色虚线边框，半透明填充）
+        for (_, x, y, l, w, yaw) in detection_data.get(frame_id, []):
             corners = rotated_rectangle_vertices(x, y, l, w, yaw)
             if swap_axes:
-                corners_swapped = corners[:, [1, 0]]  # (y, x)
+                corners_swapped = corners[:, [1, 0]]
+            else:
+                corners_swapped = corners
+            poly = patches.Polygon(corners_swapped, closed=True,
+                                   facecolor='gray', edgecolor='gray',
+                                   linewidth=1.0, alpha=0.3, linestyle='--')
+            ax.add_patch(poly)
+
+        # 2. 绘制跟踪结果（彩色实心+ID）
+        for (track_id, x, y, l, w, yaw) in tracking_data.get(frame_id, []):
+            corners = rotated_rectangle_vertices(x, y, l, w, yaw)
+            if swap_axes:
+                corners_swapped = corners[:, [1, 0]]
             else:
                 corners_swapped = corners
 
             poly = patches.Polygon(corners_swapped, closed=True,
                                    facecolor=get_color_for_id(track_id, 'tab20'),
-                                   edgecolor='black', linewidth=1, alpha=0.6)
+                                   edgecolor='black', linewidth=1.5, alpha=0.8)
             ax.add_patch(poly)
 
-            # 标注 ID，位置也要交换
             if swap_axes:
                 text_x, text_y = y, x
             else:
                 text_x, text_y = x, y
+            
             ax.text(text_x, text_y, str(track_id), ha='center', va='center',
-                    fontsize=6, color='white', weight='bold',
-                    bbox=dict(facecolor='black', alpha=0.5, boxstyle='round,pad=0.2'))
+                    fontsize=5, color='white', weight='bold',
+                    bbox=dict(facecolor='black', alpha=0.7, boxstyle='round,pad=0.2'))
 
         ax.grid(True, linestyle='--', alpha=0.5)
-
-        fig.canvas.draw()
-        img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-        img = img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        video_writer.write(img_bgr)
+        frame_filename = os.path.join(temp_dir, f"frame_{idx:06d}.png")
+        plt.savefig(frame_filename, dpi=dpi, bbox_inches='tight', pad_inches=0.1,
+                   facecolor='white', edgecolor='none')
         plt.close(fig)
 
-    video_writer.release()
-    print(f"\nVideo saved to {output_video_path}")
+    print(f"\nAll PNG frames saved. Total: {len(all_frames)}")
+
+    frame_pattern = os.path.join(temp_dir, "frame_%06d.png")
+    success = create_video_with_ffmpeg_simple(frame_pattern, output_video_path, fps=fps, bitrate=bitrate)
+    
+    if success:
+        print(f"✅ High-bitrate video saved to: {output_video_path}")
+    else:
+        print("❌ Failed to create video")
+
+    print("Cleaning up temporary files...")
+    shutil.rmtree(temp_dir)
+    print("Done!")
 
 if __name__ == "__main__":
-    # 获取本脚本所在的目录（例如 /home/.../CUDA-FastBEV/tools）
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    
-    # 构建 frames 目录和输出目录的绝对路径（相对于脚本所在目录的上一级）
     frames_directory = os.path.abspath(os.path.join(script_dir, "../outputs/frames"))
     output_directory = os.path.abspath(os.path.join(script_dir, "../outputs"))
-    
-    # 确保输出目录存在
     os.makedirs(output_directory, exist_ok=True)
     
     output_video = os.path.join(output_directory, "tracking_result.mp4")
     
     if not os.path.exists(frames_directory):
         print(f"Directory not found: {frames_directory}")
-        print(f"Please check that the path exists. Script is at: {script_dir}")
     else:
-        visualize_tracking_from_json(frames_directory, output_video, fps=6, dpi=300, figsize=(12, 12),
-                                      swap_y_sign=False, swap_axes=True)
+        visualize_tracking_from_json(
+            frames_directory, 
+            output_video, 
+            fps=6, 
+            dpi=400,
+            figsize=(12, 12),
+            swap_y_sign=False, 
+            swap_axes=True,
+            bitrate="10M"
+        )

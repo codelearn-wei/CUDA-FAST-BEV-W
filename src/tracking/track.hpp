@@ -81,36 +81,16 @@ public:
 
     // 更新（匹配到新检测）
     void update(const Detection& det, double timestamp = 0.0) {
-        // 1. 角度校正（与 Python 保持一致：确保预测与测量角度差 < 90°）
-        float pred_yaw = yaw;
-        float meas_yaw = det.yaw;
-        if (std::abs(meas_yaw - pred_yaw) > M_PI/2.0f &&
-            std::abs(meas_yaw - pred_yaw) < 3.0f*M_PI/2.0f) {
-            pred_yaw += M_PI;
-            pred_yaw = KalmanFilter::normalizeAngle(pred_yaw);
-            // 注意：这里只调整了预测角度，测量的角度不变，
-            // 但 Python 中进行了双向调整，直接调用 KF 的 update 前可无需修改测量值。
-            // KF 内部会处理，为了安全也可将 pred_yaw 写入 KF 状态（可选）。
-            // 简单起见，此处不修改测量值，因为 KF 的 update 本身有鲁棒性。
-        }
-
-        // 2. 构造测量向量
+        // 直接使用检测的原始角度
         Eigen::VectorXd z(7);
         z << det.x, det.y, det.z, det.yaw, det.l, det.w, det.h;
-
-        // 3. KF 更新
         kf_.update(z);
-
-        // 4. 同步成员变量
         syncFromKF();
-
-        // 5. 更新统计信息
         hits++;
         age++;
         time_since_update = 0;
         state = TrackState::Active;
-        score = det.score;   // 可选：保留最新检测的置信度
-
+        score = det.score;
         _push_history(timestamp);
     }
 

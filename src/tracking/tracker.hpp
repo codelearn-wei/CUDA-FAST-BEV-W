@@ -31,7 +31,7 @@ struct TrackerConfig {
     float max_dist          = 3.0f;   // 距离/代价阈值（注意：距离度量时阈值为负）
     int   min_hits          = 3;      // 轨迹确认所需的最小匹配次数
     int   max_lost_frames   = 2;      // 允许丢失的最大帧数（超过则移除）
-    double dt               = 0.05;   // 帧间时间间隔（秒）
+    double dt               = 1/6;   // 帧间时间间隔（秒）
 
     // 匹配相关
     MetricType metric       = MetricType::DIST_3D;
@@ -96,13 +96,10 @@ private:
 
     // 贪心匹配（当前 hungarian_match 实现）
     std::vector<std::pair<int,int>> greedyMatch(
-        const std::vector<std::vector<float>>& cost,
-        float max_cost) const;
+        const std::vector<std::vector<float>>& cost) const;
 
-    // 匈牙利匹配（后续实现，目前只声明）
     std::vector<std::pair<int,int>> hungarianMatch(
-        const std::vector<std::vector<float>>& cost,
-        float max_cost) const;
+        const std::vector<std::vector<float>>& cost) const;
 
     // 自车运动补偿（预留接口）
     void egoMotionCompensation(

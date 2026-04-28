@@ -33,6 +33,8 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <algorithm>
+#include <cmath>
+#include <opencv2/opencv.hpp>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
@@ -107,20 +109,94 @@ static void free_images(std::vector<unsigned char*>& images) {
   images.clear();
 }
 
-// ─── 过滤函数 ──────────────────────────────────────────────────────────────
-
+// ─── 过滤函数：置信度阈值、类别过滤 + 跨类别 IoU NMS 去重 ────
 static std::vector<fastbev::post::transbbox::BoundingBox> filter_boxes(
     const std::vector<fastbev::post::transbbox::BoundingBox>& boxes,
     float score_thr,
-    const std::set<int>& class_filter)
+    const std::set<int>& class_filter,
+    float iou_threshold = 0.3f)   // 更宽松的 IoU 阈值，适应不同尺寸重叠
 {
-  std::vector<fastbev::post::transbbox::BoundingBox> result;
-  for (const auto& box : boxes) {
-    if (box.score < score_thr) continue;
-    if (!class_filter.empty() && class_filter.find(box.id) == class_filter.end()) continue;
-    result.push_back(box);
-  }
-  return result;
+    // 第一步：置信度 + 类别过滤
+    std::vector<fastbev::post::transbbox::BoundingBox> filtered;
+    for (const auto& box : boxes) {
+        if (box.score < score_thr) continue;
+        if (!class_filter.empty() && class_filter.find(box.id) == class_filter.end()) continue;
+        filtered.push_back(box);
+    }
+    if (filtered.empty()) return {};
+
+    // 第二步：计算两个框的 BEV IoU 的辅助函数（修正角度符号）
+    auto compute_bev_iou = [](const fastbev::post::transbbox::BoundingBox& a,
+                              const fastbev::post::transbbox::BoundingBox& b) -> float {
+        // OpenCV 角度：顺时针为正，检测输出通常逆时针，故取负
+        cv::RotatedRect rect_a(
+            cv::Point2f(a.position.x, a.position.y),
+            cv::Size2f(a.size.l, a.size.w),
+            static_cast<float>(-a.z_rotation * 180.0 / M_PI)
+        );
+        cv::RotatedRect rect_b(
+            cv::Point2f(b.position.x, b.position.y),
+            cv::Size2f(b.size.l, b.size.w),
+            static_cast<float>(-b.z_rotation * 180.0 / M_PI)
+        );
+        // 获取四个顶点
+        cv::Point2f points_a[4], points_b[4];
+        rect_a.points(points_a);
+        rect_b.points(points_b);
+        std::vector<cv::Point2f> poly_a(points_a, points_a + 4);
+        std::vector<cv::Point2f> poly_b(points_b, points_b + 4);
+        // 计算交集面积
+        std::vector<cv::Point2f> intersection;
+        double inter_area = 0.0;
+        if (cv::intersectConvexConvex(poly_a, poly_b, intersection)) {
+            inter_area = cv::contourArea(intersection);
+        }
+        double area_a = rect_a.size.area();
+        double area_b = rect_b.size.area();
+        double union_area = area_a + area_b - inter_area;
+        if (union_area <= 0) return 0.0f;
+        return static_cast<float>(inter_area / union_area);
+    };
+
+    // 第三步：按置信度降序排序（高分优先）
+    std::sort(filtered.begin(), filtered.end(),
+              [](const auto& x, const auto& y) { return x.score > y.score; });
+
+    // 第四步：跨类别 NMS（不再区分类别）
+    std::vector<fastbev::post::transbbox::BoundingBox> result;
+    std::vector<bool> kept(filtered.size(), false);
+    
+    // 可选：预先计算每个框的中心，用于快速距离过滤
+    std::vector<float> cx(filtered.size()), cy(filtered.size());
+    for (size_t i = 0; i < filtered.size(); ++i) {
+        cx[i] = filtered[i].position.x;
+        cy[i] = filtered[i].position.y;
+    }
+
+    for (size_t i = 0; i < filtered.size(); ++i) {
+        if (kept[i]) continue;
+        const auto& box_i = filtered[i];
+        result.push_back(box_i);
+        kept[i] = true;
+        // 快速过滤：若中心距离 > 两个框的最大对角线的一半，则不可能有高 IoU，跳过 IoU 计算
+        float max_diag_i = std::hypot(box_i.size.l, box_i.size.w);
+        for (size_t j = i + 1; j < filtered.size(); ++j) {
+            if (kept[j]) continue;
+            float dx = cx[i] - cx[j];
+            float dy = cy[i] - cy[j];
+            float dist_centers = std::hypot(dx, dy);
+            const auto& box_j = filtered[j];
+            float max_diag_j = std::hypot(box_j.size.l, box_j.size.w);
+            // 只有中心距离小于两框最大对角线之和的一半时才计算 IoU
+            if (dist_centers > (max_diag_i + max_diag_j) * 0.5f) continue;
+            float iou = compute_bev_iou(box_i, box_j);
+            if (iou > iou_threshold) {
+                kept[j] = true;
+            }
+        }
+    }
+
+    return result;
 }
 
 // ─── 输出函数：TXT 格式 ────────────────────────────────────────────────────
@@ -373,9 +449,12 @@ int main(int argc, char** argv) {
 
     // 初始化跟踪器
     fastbev::tracking::TrackerConfig tracker_cfg;
-    tracker_cfg.max_dist = 3.0f;          // 匹配距离阈值（米）
-    tracker_cfg.max_lost_frames = 3;      // 丢失帧数上限
-    // 根据你实际 tracking 模块的配置补充其他参数（例如 min_hits 等）
+    tracker_cfg.threshold       = -0.4f;
+    tracker_cfg.metric          = fastbev::tracking::MetricType::GIOU_3D;
+    tracker_cfg.max_lost_frames = 3;     // 允许丢失5帧
+    tracker_cfg.dt              = 1.0f / 6.0f;   // 与 fps 匹配
+    tracker_cfg.algo            = fastbev::tracking::AlgoType::GREEDY;
+    tracker_cfg.min_hits        = 3;      // 没有强制使用，但可通过 outputConfirmedTracks 的 is_confirmed 调整
     fastbev::tracking::Tracker tracker(tracker_cfg);
 
     // warmup
@@ -393,7 +472,7 @@ int main(int argc, char** argv) {
 
     int total_boxes = 0;
     double timestamp = 0.0;
-    double fps = 10.0;   // 可以根据实际帧率调整，或从数据中读取
+    double fps = 6.0;   // 可以根据实际帧率调整，或从数据中读取
 
     for (const auto& fdir : frame_dirs) {
       std::string data_root = resolve_data_root(fdir);
