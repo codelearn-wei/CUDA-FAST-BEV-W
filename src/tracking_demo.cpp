@@ -57,6 +57,69 @@ static const char* CLASS_NAMES[] = {
 };
 static const int NUM_CLASSES = 10;
 
+// ─── 轻量 JSON 辅助（避免引入第三方库）────────────────────────────────────
+
+/// 从 JSON 字符串中提取 "key": <scalar_number>
+static double json_get_double(const std::string& json,
+                              const std::string& key,
+                              double default_val = 0.0)
+{
+    std::string pat = "\"" + key + "\"";
+    size_t kp = json.find(pat);
+    if (kp == std::string::npos) return default_val;
+    size_t vp = json.find_first_of("-0123456789", kp + pat.size());
+    if (vp == std::string::npos) return default_val;
+    try { return std::stod(json.substr(vp)); } catch (...) { return default_val; }
+}
+
+/// 从 JSON 字符串中提取 "key": [v0, v1, v2] 并填入 out[0..2]
+static bool json_get_array3(const std::string& json,
+                            const std::string& key,
+                            double out[3])
+{
+    std::string pat = "\"" + key + "\"";
+    size_t kp = json.find(pat);
+    if (kp == std::string::npos) return false;
+    size_t lb = json.find('[', kp + pat.size());
+    size_t rb = json.find(']', lb);
+    if (lb == std::string::npos || rb == std::string::npos) return false;
+    std::string arr = json.substr(lb + 1, rb - lb - 1);
+    // parse comma-separated numbers
+    int idx = 0;
+    size_t pos = 0;
+    while (idx < 3 && pos < arr.size()) {
+        size_t sp = arr.find_first_of("-0123456789", pos);
+        if (sp == std::string::npos) break;
+        try {
+            size_t end = 0;
+            out[idx++] = std::stod(arr.substr(sp), &end);
+            pos = sp + end;
+        } catch (...) { break; }
+    }
+    return idx == 3;
+}
+
+/// 从 frame_dir/meta.json 中读取 ego 位姿（全局坐标）
+static fastbev::tracking::EgoPose read_ego_pose(const std::string& frame_dir)
+{
+    fastbev::tracking::EgoPose pose;
+    std::string meta_path = frame_dir + "/meta.json";
+    std::ifstream f(meta_path);
+    if (!f.is_open()) return pose;
+    std::string content((std::istreambuf_iterator<char>(f)),
+                         std::istreambuf_iterator<char>());
+    f.close();
+
+    double trans[3] = {0, 0, 0};
+    if (json_get_array3(content, "ego_translation_global", trans)) {
+        pose.x = trans[0];
+        pose.y = trans[1];
+    }
+    pose.yaw   = json_get_double(content, "ego_yaw_global", 0.0);
+    pose.valid = true;  // meta.json 存在即视为有效
+    return pose;
+}
+
 // ─── 命令行参数结构 ────────────────────────────────────────────────────────
 struct InferConfig {
   std::string data_dir      = "example-data";
@@ -67,6 +130,14 @@ struct InferConfig {
   bool        batch_mode    = false;  // true: data_dir 下有 frame_* 子目录
   bool        do_warmup     = true;
   std::set<int> class_filter;         // 空 = 保留全部类别
+  // 跟踪参数
+  float       track_threshold  = -0.4f;
+  std::string track_metric_str = "giou_3d";
+  int         track_max_lost   = 3;
+  float       track_dt         = 1.0f / 6.0f;
+  std::string track_algo_str   = "greedy";
+  int         track_min_hits   = 3;
+  bool        track_ego_comp   = true;
 };
 
 // ─── 工具函数 ──────────────────────────────────────────────────────────────
@@ -400,6 +471,21 @@ static InferConfig parse_args(int argc, char** argv) {
     } else if (arg == "--no-warmup") {
       cfg.do_warmup = false;
     }
+    else if (arg == "--track-threshold" && i + 1 < argc) {
+      cfg.track_threshold = atof(argv[++i]);
+    } else if (arg == "--track-metric" && i + 1 < argc) {
+      cfg.track_metric_str = argv[++i];
+    } else if (arg == "--track-max-lost" && i + 1 < argc) {
+      cfg.track_max_lost = atoi(argv[++i]);
+    } else if (arg == "--track-dt" && i + 1 < argc) {
+      cfg.track_dt = atof(argv[++i]);
+    } else if (arg == "--track-algo" && i + 1 < argc) {
+      cfg.track_algo_str = argv[++i];
+    } else if (arg == "--track-min-hits" && i + 1 < argc) {
+      cfg.track_min_hits = atoi(argv[++i]);
+    } else if (arg == "--track-ego-comp" && i + 1 < argc) {
+      cfg.track_ego_comp = (atoi(argv[++i]) != 0);
+    }
   }
   return cfg;
 }
@@ -448,13 +534,24 @@ int main(int argc, char** argv) {
     printf("批量推理 %zu 帧...\n", frame_dirs.size());
 
     // 初始化跟踪器
+    fastbev::tracking::MetricType metric = fastbev::tracking::MetricType::GIOU_3D;
+    if (cfg.track_metric_str == "dist_3d") metric = fastbev::tracking::MetricType::DIST_3D;
+    else if (cfg.track_metric_str == "iou_3d") metric = fastbev::tracking::MetricType::IOU_3D;
+    else if (cfg.track_metric_str == "mahalanobis") metric = fastbev::tracking::MetricType::MAHALANOBIS;
+
+    fastbev::tracking::AlgoType algo;
+    if (cfg.track_algo_str == "hungarian") algo = fastbev::tracking::AlgoType::HUNGARIAN;
+    else algo = fastbev::tracking::AlgoType::GREEDY;
+
     fastbev::tracking::TrackerConfig tracker_cfg;
-    tracker_cfg.threshold       = -0.4f;
-    tracker_cfg.metric          = fastbev::tracking::MetricType::GIOU_3D;
-    tracker_cfg.max_lost_frames = 3;     // 允许丢失5帧
-    tracker_cfg.dt              = 1.0f / 6.0f;   // 与 fps 匹配
-    tracker_cfg.algo            = fastbev::tracking::AlgoType::GREEDY;
-    tracker_cfg.min_hits        = 3;      // 没有强制使用，但可通过 outputConfirmedTracks 的 is_confirmed 调整
+    tracker_cfg.threshold       = cfg.track_threshold;
+    tracker_cfg.metric          = metric;
+    tracker_cfg.max_lost_frames = cfg.track_max_lost;
+    tracker_cfg.dt              = cfg.track_dt;
+    tracker_cfg.algo            = algo;
+    tracker_cfg.min_hits        = cfg.track_min_hits;
+    tracker_cfg.enable_ego_comp = cfg.track_ego_comp;
+
     fastbev::tracking::Tracker tracker(tracker_cfg);
 
     // warmup
@@ -472,14 +569,17 @@ int main(int argc, char** argv) {
 
     int total_boxes = 0;
     double timestamp = 0.0;
-    double fps = 6.0;   // 可以根据实际帧率调整，或从数据中读取
+    double fps = 6.0;
 
     for (const auto& fdir : frame_dirs) {
       std::string data_root = resolve_data_root(fdir);
       std::string frame_name = fdir.substr(fdir.rfind('/') + 1);
       std::string out_path   = fdir + "/result" + ext;
 
-      // 执行推理（与原代码相同）
+      // 读取当前帧的 ego 全局位姿（用于 ego 运动补偿）
+      fastbev::tracking::EgoPose ego_pose = read_ego_pose(fdir);
+
+      // 执行推理
       auto images = load_images(data_root);
       bool any_valid = false;
       for (auto* img : images) if (img) { any_valid = true; break; }
@@ -525,8 +625,8 @@ int main(int argc, char** argv) {
           detections.push_back(det);
       }
 
-      // 更新跟踪器，得到轨迹
-      auto tracks = tracker.update(detections, timestamp);
+      // 更新跟踪器，得到轨迹（传入 ego 位姿以启用运动补偿）
+      auto tracks = tracker.update(detections, timestamp, ego_pose);
 
       // 可选：输出跟踪结果（打印或保存到文件）
       printf("帧 %s: 检测框 %zu, 跟踪轨迹 %zu\n", frame_name.c_str(), boxes.size(), tracks.size());

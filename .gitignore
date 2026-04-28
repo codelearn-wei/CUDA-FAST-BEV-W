@@ -4,6 +4,7 @@ model/
 example-data/
 nuscenes/
 outputs/
+outputs_0428/
 .codex
 *.plan
 *.log

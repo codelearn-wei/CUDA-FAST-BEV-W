@@ -717,6 +717,74 @@ def compose_info_bar(frame_idx: int, total_frames: int,
     return bar
 
 
+# ─── joint_result.json 读取辅助 ─────────────────────────────────────────────
+
+_MAP_TYPE_NAMES = {0: "divider", 1: "boundary", 2: "ped_crossing"}
+
+
+def _convert_joint_dets(joint_dets: list) -> list:
+    """将 joint_result.json detections 格式（x/y/z/l/w/h/class_id）
+    转换为 video_demo.py 内部格式（center_xyz/size_xyz/label/label_name）。
+    """
+    out = []
+    for d in joint_dets:
+        cid = int(d.get("class_id", 0))
+        out.append({
+            "center_xyz": [d.get("x", 0), d.get("y", 0), d.get("z", 0)],
+            "size_xyz":   [d.get("w", 1), d.get("l", 1), d.get("h", 1)],
+            "yaw":        d.get("yaw", 0),
+            "score":      d.get("score", 0),
+            "label":      cid,
+            "label_name": CLASS_NAMES[min(cid, len(CLASS_NAMES) - 1)],
+        })
+    return out
+
+
+def _load_joint_result(frame_dir: "Path"):
+    """读取 joint_result.json，返回 (detections, map_elements)。
+    detections 已转换为 video_demo.py 内部格式；
+    map_elements 格式与 map_result.json 的 elements 相同（type=str, points=[...]）。
+    若文件不存在或解析失败，返回 (None, None)。
+    """
+    jr_path = frame_dir / "joint_result.json"
+    if not jr_path.exists():
+        return None, None
+    try:
+        with open(jr_path) as f:
+            jr = json.load(f)
+    except Exception:
+        return None, None
+
+    raw_dets = jr.get("detections", [])
+    detections = _convert_joint_dets(raw_dets)
+
+    map_elems = []
+    map_sec = jr.get("map", {})
+    for elem in map_sec.get("elements", []):
+        raw_type = elem.get("type", 1)
+        if isinstance(raw_type, str):
+            type_name = raw_type
+        else:
+            try:
+                type_name = _MAP_TYPE_NAMES.get(int(raw_type), "boundary")
+            except (TypeError, ValueError):
+                type_name = "boundary"
+
+        pts = elem.get("points")
+        if pts is None:
+            pts = elem.get("pts", [])
+
+        map_elems.append({
+            "type": type_name,
+            "points": pts,
+            "is_polygon": bool(elem.get("is_polygon", False)),
+            "score": elem.get("score", 0.0),
+            "subtype": elem.get("subtype", type_name),
+        })
+
+    return detections, map_elems
+
+
 # ─── 推理调用 ─────────────────────────────────────────────────────────────────
 
 def run_inference_batch(binary: str, frames_dir: Path, model: str,
@@ -843,6 +911,8 @@ def parse_args():
                    help="BEV 中心距离 NMS 阈值（米），0=禁用，默认 0.8")
     p.add_argument("--no-map",          action="store_true",
                    help="禁用地图叠加（即使 map_result.json 存在也不显示）")
+    p.add_argument("--joint",           action="store_true",
+                   help="从 joint_result.json 读取检测和地图（joint_inference --save-json 的输出）")
     return p.parse_args()
 
 
@@ -893,24 +963,33 @@ def main():
               f"size={'on' if not args.no_size_filter else 'off'}  "
               f"vel={'on' if not args.no_vel_filter else 'off'}  "
               f"bev-nms={args.bev_nms_dist}m")
-    missing = [d for d in frame_dirs if not (d / "result.json").exists()]
-    if missing:
-        print(f"[推理] {len(missing)}/{len(frame_dirs)} 帧缺少 result.json，触发批量推理...")
-        if not Path(args.binary).exists():
-            print(f"[错误] 推理二进制不存在: {args.binary}")
-            print(f"  请先编译: cd build && cmake .. && make -j$(nproc)")
-            sys.exit(1)
-        ok = run_inference_batch(args.binary, frames_dir, args.model,
-                                 args.score_thr, args.classes)
-        if not ok:
-            print("  [降级] 批量推理失败，尝试逐帧推理...")
-            args.per_frame_infer = True
+    if args.joint:
+        # joint 模式：读取 joint_result.json，不触发 C++ 推理
+        missing_jr = [d for d in frame_dirs if not (d / "joint_result.json").exists()]
+        if missing_jr:
+            print(f"[joint 模式] {len(missing_jr)}/{len(frame_dirs)} 帧缺少 joint_result.json")
+            print(f"  请先运行: ./build/joint_inference {args.frames_dir} <model> <precision> --save-json")
         else:
-            still_missing = [d for d in frame_dirs if not (d / "result.json").exists()]
-            if still_missing:
-                print(f"  [警告] 批量推理后仍有 {len(still_missing)} 帧缺少结果")
+            print(f"[joint 模式] 所有帧已有 joint_result.json，直接读取")
     else:
-        print(f"[推理] 所有帧已有 result.json，直接读取")
+        missing = [d for d in frame_dirs if not (d / "result.json").exists()]
+        if missing:
+            print(f"[推理] {len(missing)}/{len(frame_dirs)} 帧缺少 result.json，触发批量推理...")
+            if not Path(args.binary).exists():
+                print(f"[错误] 推理二进制不存在: {args.binary}")
+                print(f"  请先编译: cd build && cmake .. && make -j$(nproc)")
+                sys.exit(1)
+            ok = run_inference_batch(args.binary, frames_dir, args.model,
+                                     args.score_thr, args.classes)
+            if not ok:
+                print("  [降级] 批量推理失败，尝试逐帧推理...")
+                args.per_frame_infer = True
+            else:
+                still_missing = [d for d in frame_dirs if not (d / "result.json").exists()]
+                if still_missing:
+                    print(f"  [警告] 批量推理后仍有 {len(still_missing)} 帧缺少结果")
+        else:
+            print(f"[推理] 所有帧已有 result.json，直接读取")
 
     # 视频写入器（延迟初始化）
     video_writer = None
@@ -923,10 +1002,20 @@ def main():
 
     for render_idx, frame_dir in enumerate(frame_dirs):
         # ── 1. 读取或执行推理 ──
-        if getattr(args, 'per_frame_infer', False):
+        if getattr(args, 'joint', False):
+            # joint 模式：从 joint_result.json 读取检测 + 地图
+            _jdets, _jmap = _load_joint_result(frame_dir)
+            if _jdets is None:
+                print(f"  [警告] {frame_dir.name}：joint_result.json 缺失，该帧无结果")
+                all_dets = []
+                _jmap = []
+            else:
+                all_dets = _jdets
+        elif getattr(args, 'per_frame_infer', False):
             all_dets = run_inference(
                 args.binary, frame_dir, args.model,
                 args.score_thr, args.classes)
+            _jmap = None
         else:
             result_path = frame_dir / "result.json"
             if result_path.exists():
@@ -938,6 +1027,7 @@ def main():
             else:
                 print(f"  [警告] {frame_dir.name}：result.json 缺失，该帧无检测结果")
                 all_dets = []
+            _jmap = None
 
         # 读取 meta.json（时间戳 + ego 位姿）
         timestamp            = 0
@@ -991,14 +1081,18 @@ def main():
         # ── 2. 读取地图元素（若存在）──
         map_elements = None
         if not getattr(args, 'no_map', False):
-            map_json = frame_dir / "map_result.json"
-            if map_json.exists():
-                try:
-                    with open(map_json) as _mf:
-                        _mr = json.load(_mf)
-                    map_elements = _mr.get("elements", [])
-                except Exception:
-                    map_elements = None
+            if getattr(args, 'joint', False):
+                # joint 模式：地图已在步骤 1 读取
+                map_elements = _jmap if _jmap else None
+            else:
+                map_json = frame_dir / "map_result.json"
+                if map_json.exists():
+                    try:
+                        with open(map_json) as _mf:
+                            _mr = json.load(_mf)
+                        map_elements = _mr.get("elements", [])
+                    except Exception:
+                        map_elements = None
 
         # ── 3. 渲染 BEV 面板（含自车速度/朝向/地图）──
         bev_panel = render_bev_panel(

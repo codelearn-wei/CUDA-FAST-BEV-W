@@ -81,9 +81,22 @@ public:
 
     // 更新（匹配到新检测）
     void update(const Detection& det, double timestamp = 0.0) {
-        // 直接使用检测的原始角度
+        // ── π 歧义修正 ────────────────────────────────────────────────────
+        // BEV 检测器存在车头/车尾方向歧义，相邻帧同一目标 yaw 可能相差约 π。
+        // 将检测 yaw 调整到与当前 track yaw 最接近的等效方向后再做 KF 更新。
+        float det_yaw = det.yaw;
+        float diff = det_yaw - yaw;
+        while (diff >  static_cast<float>(M_PI)) diff -= 2.0f * static_cast<float>(M_PI);
+        while (diff < -static_cast<float>(M_PI)) diff += 2.0f * static_cast<float>(M_PI);
+        if (std::abs(diff) > static_cast<float>(M_PI) / 2.0f) {
+            // 翻转 π 后更接近 track 当前 yaw
+            det_yaw += static_cast<float>(M_PI);
+            while (det_yaw >  static_cast<float>(M_PI)) det_yaw -= 2.0f * static_cast<float>(M_PI);
+            while (det_yaw < -static_cast<float>(M_PI)) det_yaw += 2.0f * static_cast<float>(M_PI);
+        }
+
         Eigen::VectorXd z(7);
-        z << det.x, det.y, det.z, det.yaw, det.l, det.w, det.h;
+        z << det.x, det.y, det.z, det_yaw, det.l, det.w, det.h;
         kf_.update(z);
         syncFromKF();
         hits++;
@@ -180,6 +193,19 @@ public:
     bool is_confirmed() const { return hits >= 2 && state != TrackState::Removed; }
     bool is_active()    const { return state == TrackState::Active; }
 
+    /**
+     * 自车运动补偿：将轨迹状态从上一帧 lidar-local 坐标系变换到当前帧 lidar-local 坐标系。
+     * 需在 predict() 之后、数据关联之前调用。
+     */
+    void applyEgoMotionTransform(
+        double prev_ego_x, double prev_ego_y, double prev_ego_yaw,
+        double curr_ego_x, double curr_ego_y, double curr_ego_yaw)
+    {
+        kf_.applyEgoTransform(prev_ego_x, prev_ego_y, prev_ego_yaw,
+                              curr_ego_x, curr_ego_y, curr_ego_yaw);
+        syncFromKF();
+    }
+
 private:
     void _push_history(double ts) {
         if (static_cast<int>(history.size()) >= MAX_HISTORY)
@@ -203,7 +229,13 @@ private:
         x   = static_cast<float>(state(0));
         y   = static_cast<float>(state(1));
         z   = static_cast<float>(state(2));
-        yaw = static_cast<float>(state(3));
+        // 角度归一化到 (-π, π]，避免 KF 内部线性融合使 yaw 漂移到 ±π 边界两侧
+        {
+            float raw = static_cast<float>(state(3));
+            while (raw >  static_cast<float>(M_PI)) raw -= 2.0f * static_cast<float>(M_PI);
+            while (raw < -static_cast<float>(M_PI)) raw += 2.0f * static_cast<float>(M_PI);
+            yaw = raw;
+        }
         l   = static_cast<float>(state(4));
         w   = static_cast<float>(state(5));
         h   = static_cast<float>(state(6));

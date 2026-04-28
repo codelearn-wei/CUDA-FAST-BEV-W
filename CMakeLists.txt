@@ -83,6 +83,7 @@ include_directories(
   src/common
   src/
   src/tracking
+  src/perception
   ${EIGEN3_INCLUDE_DIRS}
 )
 
@@ -102,6 +103,8 @@ file(GLOB_RECURSE CORE_FILES
   src/common/stb_image_impl.cpp
   src/camera/camera_frame.cpp
   src/pipeline/perception_pipeline.cpp
+  src/perception/image_preprocessor.cpp
+  src/perception/map_runner.cpp
   src/tracking/tracker.cpp
   src/tracking/KalmanFilter.cpp
 )
@@ -147,11 +150,25 @@ target_link_libraries(fastbev
 
 ####################### tracking_demo #############################
 cuda_add_executable(tracking_demo
-  src/tracking_demo.cpp   # 假设 tracking_demo.cpp 位于 src/ 下
-  ${VISUALIZE_FILES}      # 如果需要可视化
+  src/tracking_demo.cpp
 )
 
 target_link_libraries(tracking_demo
+  fastbev_core
+  libnvinfer.so
+  libspconv.so
+  ${Protobuf_LIBRARIES}
+  libnvinfer_plugin.so
+  ${OpenCV_LIBS}
+)
+#######################################################################
+
+####################### joint_inference #############################
+cuda_add_executable(joint_inference
+  src/joint_inference.cpp
+)
+
+target_link_libraries(joint_inference
   fastbev_core
   libnvinfer.so
   libspconv.so
