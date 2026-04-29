@@ -629,7 +629,7 @@ int main(int argc, char** argv) {
       auto tracks = tracker.update(detections, timestamp, ego_pose);
 
       // 可选：输出跟踪结果（打印或保存到文件）
-      printf("帧 %s: 检测框 %zu, 跟踪轨迹 %zu\n", frame_name.c_str(), boxes.size(), tracks.size());
+      // printf("帧 %s: 检测框 %zu, 跟踪轨迹 %zu\n", frame_name.c_str(), boxes.size(), tracks.size());
 
       // 为每一帧保存轨迹到单独文件（例如 result_tracks.json）
       if (cfg.output_format == "json") {

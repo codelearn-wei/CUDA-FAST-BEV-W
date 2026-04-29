@@ -19,6 +19,8 @@
 #include <fstream>
 #include <sstream>
 #include <sys/stat.h>
+#include <thread>     // 并行图像加载
+#include <array>
 
 // stb_image 声明（实现由 src/common/stb_image_impl.cpp 提供）
 #include <stb_image.h>
@@ -71,22 +73,41 @@ std::unique_ptr<CameraFrame> FrameLoader::load_from_dir(
     auto frame = std::make_unique<CameraFrame>();
     frame->frame_id = frame_id;
 
-    // ── 1. 加载 6 路相机图像 ───────────────────────────────────────────────────
+    // ── 1. 并行加载 6 路相机图像 ──────────────────────────────────────────────
+    // 每路图像在独立线程中解码，总耗时约等于单张最慢解码时间（而非 6 倍串行）
+    struct ImgTask {
+        std::string path;
+        unsigned char* data = nullptr;
+        int w = 0, h = 0;
+    };
+    std::array<ImgTask, NUM_CAMERAS> img_tasks;
+    for (int i = 0; i < NUM_CAMERAS; ++i)
+        img_tasks[i].path = frame_dir + "/" + IMAGE_FILES[i];
+
+    std::array<std::thread, NUM_CAMERAS> img_threads;
+    for (int i = 0; i < NUM_CAMERAS; ++i) {
+        img_threads[i] = std::thread([&img_tasks, i]() {
+            int w = 0, h = 0, ch = 0;
+            img_tasks[i].data = stbi_load(
+                img_tasks[i].path.c_str(), &w, &h, &ch, 3);
+            img_tasks[i].w = w;
+            img_tasks[i].h = h;
+        });
+    }
+    for (int i = 0; i < NUM_CAMERAS; ++i)
+        img_threads[i].join();
+
     bool any_loaded = false;
     for (int i = 0; i < NUM_CAMERAS; ++i) {
-        std::string img_path = frame_dir + "/" + IMAGE_FILES[i];
-        int w = 0, h = 0, ch = 0;
-        // stb_image 直接读取 JPEG 字节并按 RGB 顺序填充（与 nuscenes_adapter 写入匹配）
-        unsigned char* data = stbi_load(img_path.c_str(), &w, &h, &ch, 3);
-        if (!data) {
-            fprintf(stderr, "[FrameLoader] 无法加载图像: %s\n", img_path.c_str());
-            frame->images[i] = nullptr;
-        } else {
-            frame->images[i]      = data;
-            frame->image_width    = w;
-            frame->image_height   = h;
+        frame->images[i] = img_tasks[i].data;
+        if (img_tasks[i].data) {
+            frame->image_width    = img_tasks[i].w;
+            frame->image_height   = img_tasks[i].h;
             frame->image_channels = 3;
             any_loaded = true;
+        } else {
+            fprintf(stderr, "[FrameLoader] 无法加载图像: %s\n",
+                    img_tasks[i].path.c_str());
         }
     }
 

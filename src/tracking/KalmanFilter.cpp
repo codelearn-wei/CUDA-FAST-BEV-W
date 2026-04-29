@@ -93,35 +93,31 @@ void KalmanFilter::applyEgoTransform(
     double prev_ego_x, double prev_ego_y, double prev_ego_yaw,
     double curr_ego_x, double curr_ego_y, double curr_ego_yaw)
 {
-    // 1. 上一帧局部坐标 → 世界坐标
-    double cos_prev = std::cos(prev_ego_yaw);
-    double sin_prev = std::sin(prev_ego_yaw);
-    double x_world = prev_ego_x + cos_prev * x_(0) - sin_prev * x_(1);
-    double y_world = prev_ego_y + sin_prev * x_(0) + cos_prev * x_(1);
+    // 计算自车位移（从 prev 到 curr）和自车旋转变化（delta_yaw）
+    double dx_ego = curr_ego_x - prev_ego_x;
+    double dy_ego = curr_ego_y - prev_ego_y;
+    double delta_yaw = curr_ego_yaw - prev_ego_yaw;   // 自车逆时针旋转为正（需根据实际数据调整符号）
     
-    // 2. 世界坐标 → 当前帧局部坐标
-    double cos_curr = std::cos(curr_ego_yaw);
-    double sin_curr = std::sin(curr_ego_yaw);
-    double dx = x_world - curr_ego_x;
-    double dy = y_world - curr_ego_y;
-    x_(0) = cos_curr * dx + sin_curr * dy;
-    x_(1) = -sin_curr * dx + cos_curr * dy;
-    // z 保持不变（假设地面平坦）
+    // 旋转矩阵（将上一帧局部坐标系中的向量旋转到当前帧局部坐标系）
+    double cos_d = std::cos(delta_yaw);
+    double sin_d = std::sin(delta_yaw);
     
-    // 3. 航向角补偿
-    x_(3) = normalizeAngle(x_(3) + prev_ego_yaw - curr_ego_yaw);
+    // 1. 位置补偿：先旋转，再平移（加上自车位移）
+    double x_new = cos_d * x_(0) - sin_d * x_(1) + dx_ego;
+    double y_new = sin_d * x_(0) + cos_d * x_(1) + dy_ego;
+    x_(0) = x_new;
+    x_(1) = y_new;
     
-    // 4. 速度旋转
-    double delta = prev_ego_yaw - curr_ego_yaw;
-    double cos_d = std::cos(delta);
-    double sin_d = std::sin(delta);
+    // 2. 航向角补偿：目标朝向应减去自车旋转（因为自车原地旋转了delta_yaw）
+    x_(3) = normalizeAngle(x_(3) - delta_yaw);
+    
+    // 3. 速度补偿：速度向量同样旋转（不涉及平移）
     double vx_new = cos_d * x_(7) - sin_d * x_(8);
     double vy_new = sin_d * x_(7) + cos_d * x_(8);
     x_(7) = vx_new;
     x_(8) = vy_new;
-    // vz 不变
     
-    // 5. 协方差更新（雅可比矩阵）
+    // 4. 协方差更新（雅可比矩阵）
     Eigen::MatrixXd J = Eigen::MatrixXd::Identity(dim_x, dim_x);
     J(0,0) = cos_d; J(0,1) = -sin_d;
     J(1,0) = sin_d; J(1,1) =  cos_d;

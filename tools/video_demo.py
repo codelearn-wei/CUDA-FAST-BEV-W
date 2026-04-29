@@ -1021,9 +1021,15 @@ def main():
             if result_path.exists():
                 with open(result_path) as f:
                     try:
-                        all_dets = json.load(f)
+                        raw = json.load(f)
                     except json.JSONDecodeError:
-                        all_dets = []
+                        raw = []
+                # 若是 run_pipeline 输出的 x/y/z/l/w/h/class_id 格式，转换为
+                # 渲染所需的 center_xyz/size_xyz/label/label_name 格式
+                if raw and "x" in raw[0] and "center_xyz" not in raw[0]:
+                    all_dets = _convert_joint_dets(raw)
+                else:
+                    all_dets = raw
             else:
                 print(f"  [警告] {frame_dir.name}：result.json 缺失，该帧无检测结果")
                 all_dets = []
