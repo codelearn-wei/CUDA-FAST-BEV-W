@@ -619,6 +619,77 @@ python tools/video_visualize_tracking.py
 
 ---
 
+## 流式感知管线（run_pipeline）
+
+`src/run_pipeline.cpp` 是面向**实时部署**的流水线程序，模拟 ROS 话题 pub/sub 架构：
+
+```
+FrameSource（模拟 /camera_array 话题）
+    ↓ 按仿真帧率发布到 FrameBuffer（最新帧语义）
+BEV Worker（主线程 / GPU）         MapTR Worker（后台线程 / CPU）
+    TensorRT 推理                      Python subprocess 并行
+    + 多目标跟踪（含 ego 补偿）           写入 map_result.json
+    ↓ 非阻塞读取 map_result.json
+ResultWriter
+    joint_result.json / tracks.json / result.json
+```
+
+### 与 joint_inference 的区别
+
+| 特性 | `joint_inference` | `run_pipeline` |
+|------|-------------------|---------------|
+| 帧来源 | 批量读取全部帧 | 流式仿真 ROS 话题（FrameSource） |
+| 跟踪器 | 内置（无 ego 补偿） | 外部管理（含 ego 运动补偿） |
+| 帧丢弃 | 顺序处理，不丢帧 | BEV 慢时自动取最新帧（贴近实时） |
+| 接入真实传感器 | 需改造 | 仅替换 FrameSource 即可 |
+| 仿真帧率控制 | 无 | `--fps N`（默认 20 Hz） |
+| 耗时报告 | 简单打印 | 表格化（各阶段均值 + 实时性评估）|
+
+### 快速使用
+
+```bash
+# 标准运行（BEV + MapTR 并行，ego 补偿跟踪）
+./build/run_pipeline outputs/frames resnet18int8 int8 
+    --map-mode model --ckpt model/maptr/maptr_nano_r18_110e.pth
+
+# 仅 BEV（跳过 MapTR）
+./build/run_pipeline outputs/frames resnet18int8 int8 --skip-map
+
+# 指定仿真帧率（0=不限速）
+./build/run_pipeline outputs/frames resnet18int8 int8 --fps 10
+
+# 推理完成后生成可视化视频
+python tools/video_demo.py \
+    --frames-dir outputs/frames --out-dir outputs/video \
+    --joint --fps 6 --bev-size 800 --cam-width 480
+```
+
+### 输出文件（每帧目录）
+
+| 文件 | 兼容工具 | 说明 |
+|------|----------|------|
+| `joint_result.json` | `video_demo.py --joint` | BEV 检测 + 地图元素 |
+| `tracks.json` | `video_visualize_tracking.py` | 跟踪轨迹 |
+| `result.json` | `video_demo.py`（默认模式） | 仅 BEV 检测框 |
+
+### 接入真实传感器
+
+在 `src/run_pipeline.cpp` 中找到 `FrameSource::run()`，按注释替换相机驱动：
+
+```cpp
+// TODO：将此处替换为真实相机驱动
+// camera::CameraDriver driver;
+// driver.open("calib.json");
+// while (running_) {
+//   auto frame = driver.capture();
+//   buf.publish(frame.frame_dir);
+// }
+```
+
+替换后 BEV Worker 代码保持不变，无需修改推理逻辑。
+
+---
+
 ## 感知管线（Pipeline 模块）
 
 `src/pipeline/` 将检测、跟踪、过滤打包为统一接口。详见 [src/pipeline/README.md](src/pipeline/README.md)。
@@ -690,20 +761,20 @@ python tools/run_pipeline.py --skip-data-prep --skip-map
 
 ```bash
 # 1. 准备 NuScenes 帧数据
-python tools/nuscenes_adapter.py \
-    --nuscenes-dir data/nuscenes --version v1.0-mini \
+python tools/nuscenes_adapter.py 
+    --nuscenes-dir data/nuscenes --version v1.0-mini 
     --out-dir outputs/frames --num-frames 50
 
 # 2. 批量 BEV 检测 + 多目标跟踪（含 ego 运动补偿）
-./build/tracking_demo outputs/frames resnet18int8 int8 \
+./build/tracking_demo outputs/frames resnet18int8 int8 
     --score-thr 0.3 --output-format json --batch
 
 # 3. HD 地图提取（与推理并行运行，互不依赖）
-python tools/maptr/run_maptr.py \
+python tools/maptr/run_maptr.py 
     --frames-dir outputs/frames --mode gt --overwrite
 
 # 4. 生成可视化视频（含检测框 + 地图叠加）
-python tools/video_demo.py \
+python tools/video_demo.py 
     --frames-dir outputs/frames --out-dir outputs/video \
     --score-thr 0.25 --fps 6
 # 结果: outputs/video/fastbev_demo.mp4
@@ -730,6 +801,7 @@ python ptq/export_onnx.py  # 导出 ONNX
 | 模块 | 路径 | 说明 |
 |------|------|------|
 | **联合感知推理** | [src/joint_inference.cpp](src/joint_inference.cpp) | **BEV + MapTR 联合主程序（C++）** |
+| **流式感知管线** | [src/run_pipeline.cpp](src/run_pipeline.cpp) | **流式 FrameSource → BEV+跟踪 → MapTR（实时部署版）** |
 | **联合感知接口** | [src/perception/](src/perception/) | **[README](src/perception/README.md)** — 图像预处理 / MapTR 包装 / 扩展接口 |
 | **一键流水线** | [tools/run_pipeline.py](tools/run_pipeline.py) | **数据预处理 → BEV+跟踪 → MapTR → 视频，含计时和并行支持** |
 | **帧数据准备** | [tools/prepare_frame_dir.py](tools/prepare_frame_dir.py) | **自定义摄像头数据 → 帧目录（摄像头开发者使用）** |

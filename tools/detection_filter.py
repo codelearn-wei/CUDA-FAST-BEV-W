@@ -170,14 +170,48 @@ class DetectionFilter:
         n_rem = len(before) - len(after)
         return f"filter: {len(before)} → {len(after)} (-{n_rem})"
 
+    def _center_xyz(self, det: dict) -> Tuple[float, float, float]:
+        xyz = det.get("center_xyz")
+        if isinstance(xyz, (list, tuple)) and len(xyz) >= 3:
+            return float(xyz[0]), float(xyz[1]), float(xyz[2])
+        return (
+            float(det.get("x", 0.0)),
+            float(det.get("y", 0.0)),
+            float(det.get("z", 0.0)),
+        )
+
+    def _size_xyz(self, det: dict) -> Tuple[float, float, float]:
+        size = det.get("size_xyz")
+        if isinstance(size, (list, tuple)) and len(size) >= 3:
+            return float(size[0]), float(size[1]), float(size[2])
+        return (
+            float(det.get("w", 1.0)),
+            float(det.get("l", 1.0)),
+            float(det.get("h", 1.0)),
+        )
+
+    def _velocity_xy(self, det: dict) -> Tuple[float, float]:
+        vel = det.get("velocity_xy")
+        if isinstance(vel, (list, tuple)) and len(vel) >= 2:
+            return float(vel[0]), float(vel[1])
+        return (
+            float(det.get("vx", 0.0)),
+            float(det.get("vy", 0.0)),
+        )
+
+    def _class_id(self, det: dict) -> int:
+        if "label" in det:
+            return int(det.get("label", -1))
+        return int(det.get("class_id", -1))
+
     # ── 内部规则（每条独立） ───────────────────────────────────────────────────
 
     def _pass_rules(self, det: dict) -> bool:
-        cid   = det.get("label", -1)
+        cid   = self._class_id(det)
         score = det.get("score", 0.0)
-        xyz   = det.get("center_xyz", [0.0, 0.0, 0.0])
-        size  = det.get("size_xyz",   [1.0, 1.0, 1.0])
-        vel   = det.get("velocity_xy", [0.0, 0.0])
+        xyz   = self._center_xyz(det)
+        size  = self._size_xyz(det)
+        vel   = self._velocity_xy(det)
 
         # 1. 置信度
         if score < self.cfg.score_thr:
@@ -225,14 +259,14 @@ class DetectionFilter:
         for i in range(len(dets)):
             if suppressed[i]:
                 continue
-            xi, yi = dets[i]["center_xyz"][0], dets[i]["center_xyz"][1]
-            ci = dets[i].get("label", -1)
+            xi, yi = self._center_xyz(dets[i])[:2]
+            ci = self._class_id(dets[i])
             for j in range(i + 1, len(dets)):
                 if suppressed[j]:
                     continue
-                if dets[j].get("label", -1) != ci:
+                if self._class_id(dets[j]) != ci:
                     continue
-                xj, yj = dets[j]["center_xyz"][0], dets[j]["center_xyz"][1]
+                xj, yj = self._center_xyz(dets[j])[:2]
                 if (xi - xj) ** 2 + (yi - yj) ** 2 < dist_sq:
                     suppressed[j] = True
 

@@ -34,7 +34,7 @@ std::vector<std::vector<float>> Tracker::buildCostMatrix(
     const int n_det = static_cast<int>(dets.size());
     std::vector<std::vector<float>> cost(n_trk, std::vector<float>(n_det, 1e9f));
 
-    const float max_angle_diff = 60.0f * M_PI / 180.0f;
+    const float max_angle_diff = 90.0f * M_PI / 180.0f;
 
     for (int i = 0; i < n_trk; ++i) {
         for (int j = 0; j < n_det; ++j) {
@@ -173,13 +173,94 @@ std::vector<std::pair<int,int>> Tracker::greedyMatch(
     return matches;
 }
 
-// ─── 匈牙利匹配（全矩阵，暂用贪心替代，可替换为真实匈牙利）────────
+// ─── 匈牙利算法（最小权完美匹配，支持矩形矩阵）────────────────────
 std::vector<std::pair<int,int>> Tracker::hungarianMatch(
-    const std::vector<std::vector<float>>& cost) const   // 移除 max_cost
+    const std::vector<std::vector<float>>& cost) const
 {
-    // TODO: 实现标准匈牙利算法
-    // 这里暂时调用贪心以保证功能
-    return greedyMatch(cost);
+    int n_rows = static_cast<int>(cost.size());
+    if (n_rows == 0) return {};
+    int n_cols = static_cast<int>(cost[0].size());
+
+    // 确保行数 <= 列数，否则转置后求解
+    bool transposed = false;
+    std::vector<std::vector<double>> cost_double;
+    if (n_rows > n_cols) {
+        transposed = true;
+        cost_double.resize(n_cols, std::vector<double>(n_rows));
+        for (int i = 0; i < n_rows; ++i)
+            for (int j = 0; j < n_cols; ++j)
+                cost_double[j][i] = static_cast<double>(cost[i][j]);
+        std::swap(n_rows, n_cols);
+    } else {
+        cost_double.resize(n_rows, std::vector<double>(n_cols));
+        for (int i = 0; i < n_rows; ++i)
+            for (int j = 0; j < n_cols; ++j)
+                cost_double[i][j] = static_cast<double>(cost[i][j]);
+    }
+
+    const double INF = 1e18;
+    std::vector<double> u(n_rows + 1, 0.0);   // 行势，1-indexed
+    std::vector<double> v(n_cols + 1, 0.0);   // 列势
+    std::vector<int> p(n_cols + 1, 0);        // 匹配：列 j 匹配的行 p[j]
+    std::vector<int> way(n_cols + 1, 0);      // 路径记录
+
+    for (int i = 1; i <= n_rows; ++i) {
+        p[0] = i;
+        int j0 = 0;
+        std::vector<double> minv(n_cols + 1, INF);
+        std::vector<bool> used(n_cols + 1, false);
+        do {
+            used[j0] = true;
+            int i0 = p[j0];
+            double delta = INF;
+            int j1 = 0;
+            for (int j = 1; j <= n_cols; ++j) {
+                if (!used[j]) {
+                    double cur = cost_double[i0 - 1][j - 1] - u[i0] - v[j];
+                    if (cur < minv[j]) {
+                        minv[j] = cur;
+                        way[j] = j0;
+                    }
+                    if (minv[j] < delta) {
+                        delta = minv[j];
+                        j1 = j;
+                    }
+                }
+            }
+            for (int j = 0; j <= n_cols; ++j) {
+                if (used[j]) {
+                    u[p[j]] += delta;
+                    v[j] -= delta;
+                } else {
+                    minv[j] -= delta;
+                }
+            }
+            j0 = j1;
+        } while (p[j0] != 0);
+        // 增广路径更新
+        do {
+            int j1 = way[j0];
+            p[j0] = p[j1];
+            j0 = j1;
+        } while (j0 != 0);
+    }
+
+    // 构建匹配结果
+    std::vector<std::pair<int,int>> matches;
+    if (!transposed) {
+        for (int j = 1; j <= n_cols; ++j) {
+            if (p[j] != 0) {
+                matches.emplace_back(p[j] - 1, j - 1);
+            }
+        }
+    } else {
+        for (int j = 1; j <= n_cols; ++j) {
+            if (p[j] != 0) {
+                matches.emplace_back(j - 1, p[j] - 1);
+            }
+        }
+    }
+    return matches;
 }
 
 // ─── 数据关联入口（先全匹配，再阈值过滤）────────────────────────
@@ -320,7 +401,18 @@ std::vector<Track> Tracker::update(const std::vector<Detection>& detections,
     
     // 3. 自车运动补偿：将预测后的轨迹状态从上一帧坐标系转到当前帧坐标系
     if (cfg_.enable_ego_comp && current_ego.valid && prev_ego_pose_.valid) {
-        egoMotionCompensation(tracks_, prev_ego_pose_, current_ego);
+        double dx = current_ego.x - prev_ego_pose_.x;
+        double dy = current_ego.y - prev_ego_pose_.y;
+        double dpos = std::sqrt(dx*dx + dy*dy);
+        float dyaw = std::abs(current_ego.yaw - prev_ego_pose_.yaw);
+        dyaw = std::min(dyaw, 2.0f * float(M_PI) - dyaw);
+        if (dpos > 10.0 || dyaw > 0.5f) {   // 跳变阈值
+            printf("[Tracker] 检测到位姿跳变，清空所有轨迹 (dpos=%.2f, dyaw=%.2f rad)\n", dpos, dyaw);
+            tracks_.clear();
+            next_id_ = 1;
+        } else {
+            egoMotionCompensation(tracks_, prev_ego_pose_, current_ego);
+        }
     }
     
     // 4. 保存当前 ego 位姿为下一帧的上一帧位姿

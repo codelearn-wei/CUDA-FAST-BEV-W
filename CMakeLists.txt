@@ -105,6 +105,7 @@ file(GLOB_RECURSE CORE_FILES
   src/pipeline/perception_pipeline.cpp
   src/perception/image_preprocessor.cpp
   src/perception/map_runner.cpp
+  src/perception/map_runner_persistent.cpp
   src/tracking/tracker.cpp
   src/tracking/KalmanFilter.cpp
 )
@@ -169,6 +170,21 @@ cuda_add_executable(joint_inference
 )
 
 target_link_libraries(joint_inference
+  fastbev_core
+  libnvinfer.so
+  libspconv.so
+  ${Protobuf_LIBRARIES}
+  libnvinfer_plugin.so
+  ${OpenCV_LIBS}
+)
+#######################################################################
+
+####################### run_pipeline ################################
+cuda_add_executable(run_pipeline
+  src/run_pipeline.cpp
+)
+
+target_link_libraries(run_pipeline
   fastbev_core
   libnvinfer.so
   libspconv.so

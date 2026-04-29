@@ -12,6 +12,9 @@
 #include <fstream>
 #include <sstream>
 #include <sys/stat.h>
+#include <thread>
+#include <mutex>
+#include <array>
 
 // stb_image 读取图像（实现由 src/common/stb_image_impl.cpp 提供）
 #include <stb_image.h>
@@ -511,34 +514,79 @@ bool ImagePreprocessor::_from_images_and_meta(const std::string& frame_dir,
         // row 2: 0, 0, 1（不变）
     }
 
-    // ── 加载 6 路图像 ─────────────────────────────────────────────────────
-    unsigned char* imgs[camera::NUM_CAMERAS] = {};
-    int img_w = -1, img_h = -1;
-    for (int i = 0; i < camera::NUM_CAMERAS; ++i) {
-        std::string img_path = frame_dir + "/" + IMAGE_FILES[i];
-        int w = 0, h = 0, ch = 0;
-        imgs[i] = stbi_load(img_path.c_str(), &w, &h, &ch, 3);
-        if (!imgs[i]) {
-            fprintf(stderr,
-                    "[ImagePreprocessor] 图像加载失败: %s\n",
-                    img_path.c_str());
-            // 释放已加载的图像
-            for (int j = 0; j < i; ++j)
-                if (imgs[j]) stbi_image_free(imgs[j]);
-            return false;
-        }
-        if (img_w < 0) { img_w = w; img_h = h; }
-    }
+    // ─── 几何张量静态缓存 ──────────────────────────────────────────────────
+    // 同一场景内相机标定固定，几何张量只需计算一次，后续帧直接复用。
+    // 使用 copy-on-read 语义：首帧计算并缓存，后续帧复制缓存指针的内容。
+    struct GeomCache {
+        std::mutex mtx;
+        bool       ready = false;
+        int        NVOX  = 0;
+        float*     cidx  = nullptr;
+        int64_t*   xbuf  = nullptr;
+        int64_t*   ybuf  = nullptr;
+    };
+    static GeomCache s_gc;
 
-    // ── 计算每相机几何张量 ────────────────────────────────────────────────
-    GeometryParams geo;  // 使用默认参数（200×200×4 体素，feat 64×176）
+    GeometryParams geo;  // 默认参数（200×200×4 体素）
     const int NVOX = geo.num_voxels();
 
+    // 分配当前帧张量缓冲区
     float*   cidx = new float  [camera::NUM_CAMERAS * NVOX]();
     int64_t* xbuf = new int64_t[camera::NUM_CAMERAS * NVOX]();
     int64_t* ybuf = new int64_t[camera::NUM_CAMERAS * NVOX]();
 
-    compute_geometry_per_cam(ext_raw, K_scaled, vox_origin, geo, cidx, xbuf, ybuf);
+    {
+        std::unique_lock<std::mutex> lk(s_gc.mtx);
+        if (s_gc.ready) {
+            // 命中缓存：直接复制几何张量（μs 级，比重新计算快约 1000x）
+            memcpy(cidx, s_gc.cidx, sizeof(float)   * camera::NUM_CAMERAS * NVOX);
+            memcpy(xbuf, s_gc.xbuf, sizeof(int64_t) * camera::NUM_CAMERAS * NVOX);
+            memcpy(ybuf, s_gc.ybuf, sizeof(int64_t) * camera::NUM_CAMERAS * NVOX);
+        } else {
+            // 首帧：计算几何张量并写入缓存
+            compute_geometry_per_cam(ext_raw, K_scaled, vox_origin, geo, cidx, xbuf, ybuf);
+            s_gc.cidx  = new float  [camera::NUM_CAMERAS * NVOX];
+            s_gc.xbuf  = new int64_t[camera::NUM_CAMERAS * NVOX];
+            s_gc.ybuf  = new int64_t[camera::NUM_CAMERAS * NVOX];
+            s_gc.NVOX  = NVOX;
+            memcpy(s_gc.cidx, cidx, sizeof(float)   * camera::NUM_CAMERAS * NVOX);
+            memcpy(s_gc.xbuf, xbuf, sizeof(int64_t) * camera::NUM_CAMERAS * NVOX);
+            memcpy(s_gc.ybuf, ybuf, sizeof(int64_t) * camera::NUM_CAMERAS * NVOX);
+            s_gc.ready = true;
+            printf("[ImagePreprocessor] 几何张量已缓存（后续帧直接复用）\n");
+        }
+    }
+
+    // ── 并行加载 6 路图像（与 camera_frame.cpp 一致，6-thread） ──────────
+    struct ImgTask { std::string path; unsigned char* data = nullptr; int w = 0, h = 0; };
+    std::array<ImgTask, camera::NUM_CAMERAS> tasks;
+    for (int i = 0; i < camera::NUM_CAMERAS; ++i)
+        tasks[i].path = frame_dir + "/" + IMAGE_FILES[i];
+
+    std::array<std::thread, camera::NUM_CAMERAS> threads;
+    for (int i = 0; i < camera::NUM_CAMERAS; ++i) {
+        threads[i] = std::thread([&tasks, i]() {
+            int w = 0, h = 0, ch = 0;
+            tasks[i].data = stbi_load(tasks[i].path.c_str(), &w, &h, &ch, 3);
+            tasks[i].w = w;  tasks[i].h = h;
+        });
+    }
+    for (int i = 0; i < camera::NUM_CAMERAS; ++i) threads[i].join();
+
+    unsigned char* imgs[camera::NUM_CAMERAS] = {};
+    int img_w = -1, img_h = -1;
+    for (int i = 0; i < camera::NUM_CAMERAS; ++i) {
+        if (!tasks[i].data) {
+            fprintf(stderr, "[ImagePreprocessor] 图像加载失败: %s\n",
+                    tasks[i].path.c_str());
+            for (int j = 0; j < camera::NUM_CAMERAS; ++j)
+                if (tasks[j].data) stbi_image_free(tasks[j].data);
+            delete[] cidx; delete[] xbuf; delete[] ybuf;
+            return false;
+        }
+        imgs[i] = tasks[i].data;
+        if (img_w < 0) { img_w = tasks[i].w; img_h = tasks[i].h; }
+    }
 
     // ── 填充 bev_frame ────────────────────────────────────────────────────
     bev_frame.frame_id       = frame_id;
