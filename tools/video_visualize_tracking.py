@@ -124,8 +124,15 @@ def rotated_rectangle_vertices(cx, cy, len_x, len_y, angle_rad):
     返回旋转矩形的四个顶点（世界坐标）。
     len_x: 横向宽度（沿 x 方向）
     len_y: 纵向长度（沿 y 方向）
-    angle_rad: 航向角，0 表示矩形长边沿 y 轴正方向（前向）
+    angle_rad: 航向角，0 表示矩形长边指向 -Y 方向（向后），顺时针为正。
+              函数内部会转换为标准角度（0指向+Y，逆时针）进行绘制。
     """
+    # 将原始角度转换为方向向量 (dx, dy)
+    dx = np.sin(angle_rad)      # sin(0)=0, sin(π/2)=1, ...
+    dy = -np.cos(angle_rad)     # cos(0)=1 => dy=-1 (向后); cos(π/2)=0 => dy=0 (横向)
+    # 由方向向量计算标准角度（0指向+Y，逆时针）
+    angle_viz = np.arctan2(dx, dy)   # atan2(0, -1)=π; atan2(1,0)=π/2; ...
+    
     half_x = len_x / 2.0
     half_y = len_y / 2.0
     corners_local = np.array([
@@ -134,8 +141,8 @@ def rotated_rectangle_vertices(cx, cy, len_x, len_y, angle_rad):
         [ half_x,  half_y],
         [-half_x,  half_y]
     ])
-    cos_a = np.cos(angle_rad)
-    sin_a = np.sin(angle_rad)
+    cos_a = np.cos(angle_viz)
+    sin_a = np.sin(angle_viz)
     rot_mat = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
     corners = corners_local @ rot_mat.T
     corners[:, 0] += cx
@@ -175,12 +182,10 @@ def create_video_with_ffmpeg_simple(frame_pattern, output_video, fps=6, bitrate=
             '-i', frame_pattern,
             '-vf', scale_filter,
             '-c:v', 'libx264',
-            '-preset', 'veryslow',
             '-b:v', bitrate,
             '-minrate', bitrate,
             '-maxrate', bitrate,
             '-bufsize', '10M',
-            '-x264-params', 'nal-hrd=cbr:force-cfr=1',
             '-profile:v', 'high',
             '-level', '5.1',
             '-pix_fmt', 'yuv420p',
@@ -359,7 +364,7 @@ if __name__ == "__main__":
                     help="手动设置 X 轴范围")
     _p.add_argument("--ylim",       type=float, nargs=2, metavar=('MIN','MAX'), default=[-40.0, 40.0],
                     help="手动设置 Y 轴范围")
-    _p.add_argument("--yaw-offset", type=float, default=-np.pi,
+    _p.add_argument("--yaw-offset", type=float, default=0,
                     help="航向角偏移（弧度），默认 -π 使 0 指向 y 正前方")
     _a = _p.parse_args()
 

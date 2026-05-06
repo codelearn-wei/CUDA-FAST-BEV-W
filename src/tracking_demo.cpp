@@ -134,7 +134,7 @@ struct InferConfig {
   float       track_threshold  = -0.4f;
   std::string track_metric_str = "giou_3d";
   int         track_max_lost   = 3;
-  float       track_dt         = 1.0f / 6.0f;
+  float       track_dt         = 0.5f;
   std::string track_algo_str   = "greedy";
   int         track_min_hits   = 3;
   bool        track_ego_comp   = true;
@@ -569,7 +569,7 @@ int main(int argc, char** argv) {
 
     int total_boxes = 0;
     double timestamp = 0.0;
-    double fps = 6.0;
+    double fps = 2.0;
 
     for (const auto& fdir : frame_dirs) {
       std::string data_root = resolve_data_root(fdir);

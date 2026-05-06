@@ -81,24 +81,21 @@ public:
 
     // 更新（匹配到新检测）
     void update(const Detection& det, double timestamp = 0.0) {
-        // ── π 歧义修正 ────────────────────────────────────────────────────
-        // BEV 检测器存在车头/车尾方向歧义，相邻帧同一目标 yaw 可能相差约 π。
-        // 将检测 yaw 调整到与当前 track yaw 最接近的等效方向后再做 KF 更新。
+        // 已经移除了 π 歧义修正
         float det_yaw = det.yaw;
-        float diff = det_yaw - yaw;
-        while (diff >  static_cast<float>(M_PI)) diff -= 2.0f * static_cast<float>(M_PI);
-        while (diff < -static_cast<float>(M_PI)) diff += 2.0f * static_cast<float>(M_PI);
-        if (std::abs(diff) > static_cast<float>(M_PI) / 2.0f) {
-            // 翻转 π 后更接近 track 当前 yaw
-            det_yaw += static_cast<float>(M_PI);
-            while (det_yaw >  static_cast<float>(M_PI)) det_yaw -= 2.0f * static_cast<float>(M_PI);
-            while (det_yaw < -static_cast<float>(M_PI)) det_yaw += 2.0f * static_cast<float>(M_PI);
-        }
-
-        Eigen::VectorXd z(7);
-        z << det.x, det.y, det.z, det_yaw, det.l, det.w, det.h;
+        Eigen::VectorXd z(9);
+        z << det.x, det.y, det.z, det_yaw, det.l, det.w, det.h, det.vx, det.vy;
         kf_.update(z);
         syncFromKF();
+
+        // ========== 速度融合（关键修复）==========
+        // 检测速度已经处于局部坐标系（x右, y前），直接使用
+        const float alpha = 0.6f;       // 检测速度权重，可根据噪声调整
+        vx = alpha * det.vx + (1.0f - alpha) * vx;
+        vy = alpha * det.vy + (1.0f - alpha) * vy;
+        // 可选：同时更新卡尔曼滤波器中的速度状态（保持一致性）
+        // 但 KF 内部速度不参与测量更新，直接覆盖可能导致不一致，因此只更新 Track 成员变量即可
+
         hits++;
         age++;
         time_since_update = 0;
@@ -108,7 +105,7 @@ public:
     }
 
     // 预测（无匹配）
-    void predict(double dt = 0.05) {
+    void predict(double dt = 0.5) {
         kf_.predict(dt);
         syncFromKF();               // 同步 x, y, z, vx, vy, yaw, w, l, h
         age++;

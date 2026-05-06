@@ -8,7 +8,7 @@ namespace tracking {
 class KalmanFilter {
 public:
     static const int dim_x = 10;   // x,y,z,theta,l,w,h,dx,dy,dz
-    static const int dim_z = 7;    // x,y,z,theta,l,w,h
+    static const int dim_z = 9;    // x,y,z,theta,l,w,h
 
     KalmanFilter();
 
@@ -54,6 +54,10 @@ private:
     Eigen::MatrixXd H_;      // 测量矩阵 (7x10)
     Eigen::MatrixXd Q_;      // 过程噪声 (10x10)
     Eigen::MatrixXd R_;      // 测量噪声 (7x7)
+
+    // 用于静止抑制的成员变量（每个KalmanFilter实例独立记录）
+    double last_x_ = 0.0;
+    double last_y_ = 0.0;
 };
 
 } // namespace tracking
