@@ -24,7 +24,7 @@ static float normalizeThreshold(float thres, MetricType metric) {
     }
 }
 
-// 局部 → 全局
+// 局部 → 全局（加入自车速度补偿）
 void localToWorld(float x_local, float y_local, float yaw_local,
                   float vx_local, float vy_local,
                   const EgoPose& ego,
@@ -32,17 +32,18 @@ void localToWorld(float x_local, float y_local, float yaw_local,
                   float& vx_world, float& vy_world) {
     float cos_ego = std::cos(ego.yaw);
     float sin_ego = std::sin(ego.yaw);
-    // 位置变换（不变，因为局部轴方向已由该矩阵正确映射）
     x_world = ego.x + (-sin_ego) * x_local + cos_ego * y_local;
     y_world = ego.y +  cos_ego * x_local + sin_ego * y_local;
-    // 角度变换：局部朝向 α -> 全局朝向 β = θ + π - α
     yaw_world = KalmanFilter::normalizeAngle(ego.yaw + static_cast<float>(M_PI) - yaw_local);
-    // 速度变换（同位置旋转）
-    vx_world = (-sin_ego) * vx_local + cos_ego * vy_local;
-    vy_world =  cos_ego * vx_local + sin_ego * vy_local;
+    // 相对速度旋转到全局
+    float vx_rel_rot = (-sin_ego) * vx_local + cos_ego * vy_local;
+    float vy_rel_rot =  cos_ego * vx_local + sin_ego * vy_local;
+    // 加上自车速度得到绝对速度
+    vx_world = vx_rel_rot + static_cast<float>(ego.vx);
+    vy_world = vy_rel_rot + static_cast<float>(ego.vy);
 }
 
-// 全局 → 局部
+// 全局 → 局部（减去自车速度）
 void worldToLocal(float x_world, float y_world, float yaw_world,
                   float vx_world, float vy_world,
                   const EgoPose& ego,
@@ -52,14 +53,15 @@ void worldToLocal(float x_world, float y_world, float yaw_world,
     float dy = y_world - ego.y;
     float cos_ego = std::cos(ego.yaw);
     float sin_ego = std::sin(ego.yaw);
-    // 位置逆变换
     x_local = (-sin_ego) * dx + cos_ego * dy;
     y_local =  cos_ego * dx + sin_ego * dy;
-    // 角度逆变换：全局 β -> 局部 α = θ + π - β
     yaw_local = KalmanFilter::normalizeAngle(ego.yaw + static_cast<float>(M_PI) - yaw_world);
-    // 速度逆变换
-    vx_local = (-sin_ego) * vx_world + cos_ego * vy_world;
-    vy_local =  cos_ego * vx_world + sin_ego * vy_world;
+    // 全局绝对速度减去自车速度得到相对速度
+    float vx_abs_rel = vx_world - static_cast<float>(ego.vx);
+    float vy_abs_rel = vy_world - static_cast<float>(ego.vy);
+    // 旋转回局部
+    vx_local = (-sin_ego) * vx_abs_rel + cos_ego * vy_abs_rel;
+    vy_local =  cos_ego * vx_abs_rel + sin_ego * vy_abs_rel;
 }
 
 // ─── 构建代价矩阵（不变）────────────────────────────────────────
@@ -381,184 +383,91 @@ std::vector<Track> Tracker::update(const std::vector<Detection>& detections,
         float dyaw = std::abs(current_ego.yaw - prev_ego_pose_.yaw);
         dyaw = std::min(dyaw, 2.0f * float(M_PI) - dyaw);
         if (dpos > 10.0 || dyaw > 0.5f) {
-            printf("[Tracker] 位姿跳变，清空轨迹\n");
             tracks_.clear();
             next_id_ = 1;
         }
     }
     if (current_ego.valid) prev_ego_pose_ = current_ego;
 
-    // 保存原始检测局部坐标（用于对比）
-    std::vector<Detection> local_dets = detections;
+    // 计算自车全局速度（通过位姿差分）
+    EgoPose ego_with_vel = current_ego;
+    if (current_ego.valid && prev_timestamp_ > 0 && prev_ego_pose_for_velocity_.valid) {
+        double dt = timestamp - prev_timestamp_;
+        if (dt > 1e-6 && dt < 1.0) {
+            ego_with_vel.vx = (current_ego.x - prev_ego_pose_for_velocity_.x) / dt;
+            ego_with_vel.vy = (current_ego.y - prev_ego_pose_for_velocity_.y) / dt;
+        } else {
+            ego_with_vel.vx = 0.0; ego_with_vel.vy = 0.0;
+        }
+    } else {
+        ego_with_vel.vx = 0.0; ego_with_vel.vy = 0.0;
+    }
+    prev_ego_pose_for_velocity_ = current_ego;
+    prev_timestamp_ = timestamp;
 
-    // 1. 检测局部 -> 全局，并打印速度
     std::vector<Detection> world_dets;
-    printf("\n[Frame t=%.3f] detections=%zu\n", timestamp, detections.size());
-    if (cfg_.enable_ego_comp && current_ego.valid) {
+    if (cfg_.enable_ego_comp && ego_with_vel.valid) {
         for (size_t i = 0; i < detections.size(); ++i) {
             const auto& det = detections[i];
-            printf("  det%d: LOCAL  pos=(%6.2f,%6.2f) yaw=%6.3f vx=%6.3f vy=%6.3f\n",
-                   (int)i, det.x, det.y, det.yaw, det.vx, det.vy);
             Detection det_world = det;
-            localToWorld(det.x, det.y, det.yaw, det.vx, det.vy,
-                         current_ego,
-                         det_world.x, det_world.y, det_world.yaw,
-                         det_world.vx, det_world.vy);
+            localToWorld(det.x, det.y, det.yaw, det.vx, det.vy, ego_with_vel, det_world.x, det_world.y, det_world.yaw, det_world.vx, det_world.vy);
             world_dets.push_back(det_world);
-            printf("  det%d: GLOBAL pos=(%6.2f,%6.2f) yaw=%6.3f vx=%6.3f vy=%6.3f  ego=(%6.2f,%6.2f) yaw=%6.3f\n",
-                   (int)i, det_world.x, det_world.y, det_world.yaw, det_world.vx, det_world.vy,
-                   current_ego.x, current_ego.y, current_ego.yaw);
         }
     } else {
         world_dets = detections;
-        printf("[Warning] 未启用 ego 补偿\n");
     }
 
-    // 2. 预测世界坐标系下的轨迹，并打印预测前后的局部和全局
     double dt = cfg_.dt;
-    printf("预测 dt=%.3f, 已有轨迹数=%zu\n", dt, tracks_.size());
-    static int print_cnt = 0;
     for (auto& trk : tracks_) {
-        // 预测前局部坐标（用当前 ego 转换）
-        float local_before_x, local_before_y, local_before_yaw, local_before_vx, local_before_vy;
-        worldToLocal(trk.x, trk.y, trk.yaw,
-                     trk.vx, trk.vy,
-                     current_ego,
-                     local_before_x, local_before_y, local_before_yaw,
-                     local_before_vx, local_before_vy);
-        float old_vx = trk.vx, old_vy = trk.vy;
         trk.predict(dt);
-        // 预测后局部坐标
-        float local_after_x, local_after_y, local_after_yaw, local_after_vx, local_after_vy;
-        worldToLocal(trk.x, trk.y, trk.yaw,
-                     trk.vx, trk.vy,
-                     current_ego,
-                     local_after_x, local_after_y, local_after_yaw,
-                     local_after_vx, local_after_vy);
-        if (print_cnt < 5) {
-            printf("  trk%llu predict BEFORE: GLOBAL pos=(%6.2f,%6.2f) yaw=%6.3f vx=%6.3f vy=%6.3f -> LOCAL pos=(%6.2f,%6.2f) yaw=%6.3f vx=%6.3f vy=%6.3f\n",
-                   trk.track_id, trk.x, trk.y, trk.yaw, old_vx, old_vy,
-                   local_before_x, local_before_y, local_before_yaw, local_before_vx, local_before_vy);
-            printf("           AFTER : GLOBAL pos=(%6.2f,%6.2f) yaw=%6.3f vx=%6.3f vy=%6.3f -> LOCAL pos=(%6.2f,%6.2f) yaw=%6.3f vx=%6.3f vy=%6.3f\n",
-                   trk.x, trk.y, trk.yaw, trk.vx, trk.vy,
-                   local_after_x, local_after_y, local_after_yaw, local_after_vx, local_after_vy);
-            print_cnt++;
-        }
     }
 
-    // 3. 构建代价矩阵并关联（注意：buildCostMatrix 内部已修复角度差计算）
     auto cost = buildCostMatrix(world_dets, tracks_);
     auto matchRes = dataAssociation(world_dets, tracks_, cost);
-    printf("关联结果: matches=%zu, unmatched_dets=%zu, unmatched_trks=%zu\n",
-           matchRes.matches.size(), matchRes.unmatched_dets.size(), matchRes.unmatched_trks.size());
 
-    // 打印匹配的详细信息（全局 + 局部）
-    for (const auto& m : matchRes.matches) {
-        const Track& trk = tracks_[m.first];
-        const Detection& det = world_dets[m.second];
-        // 轨迹转换到当前局部
-        float trk_local_x, trk_local_y, trk_local_yaw, trk_local_vx, trk_local_vy;
-        worldToLocal(trk.x, trk.y, trk.yaw,
-                     trk.vx, trk.vy,
-                     current_ego,
-                     trk_local_x, trk_local_y, trk_local_yaw,
-                     trk_local_vx, trk_local_vy);
-        // 原始检测局部坐标（从 local_dets 获取）
-        const Detection& local_det = local_dets[m.second];
-        printf("  Match trk%llu <-> det%d: cost=%.3f\n"
-               "        trk GLOBAL: pos=(%6.2f,%6.2f) yaw=%6.3f vx=%6.3f vy=%6.3f\n"
-               "        trk LOCAL : pos=(%6.2f,%6.2f) yaw=%6.3f vx=%6.3f vy=%6.3f\n"
-               "        det GLOBAL: pos=(%6.2f,%6.2f) yaw=%6.3f vx=%6.3f vy=%6.3f\n"
-               "        det LOCAL : pos=(%6.2f,%6.2f) yaw=%6.3f vx=%6.3f vy=%6.3f\n",
-               trk.track_id, m.second, cost[m.first][m.second],
-               trk.x, trk.y, trk.yaw, trk.vx, trk.vy,
-               trk_local_x, trk_local_y, trk_local_yaw, trk_local_vx, trk_local_vy,
-               det.x, det.y, det.yaw, det.vx, det.vy,
-               local_det.x, local_det.y, local_det.yaw, local_det.vx, local_det.vy);
-    }
-
-    // 4. 更新匹配的轨迹（Track::update 中已移除 π 歧义修正）
     for (const auto& m : matchRes.matches) {
         Track& trk = tracks_[m.first];
         const Detection& det = world_dets[m.second];
-        float old_vx = trk.vx, old_vy = trk.vy;
-        float old_x = trk.x, old_y = trk.y, old_yaw = trk.yaw;
-        // 更新前局部
-        float local_before_x, local_before_y, local_before_yaw, local_before_vx, local_before_vy;
-        worldToLocal(old_x, old_y, old_yaw, old_vx, old_vy,
-                     current_ego,
-                     local_before_x, local_before_y, local_before_yaw,
-                     local_before_vx, local_before_vy);
         trk.time_since_update = 0;
         trk.hits++;
-        trk.update(det, timestamp);   // 此处 update 已不使用 π 翻转
-        // 更新后局部
-        float local_after_x, local_after_y, local_after_yaw, local_after_vx, local_after_vy;
-        worldToLocal(trk.x, trk.y, trk.yaw, trk.vx, trk.vy,
-                     current_ego,
-                     local_after_x, local_after_y, local_after_yaw,
-                     local_after_vx, local_after_vy);
-        printf("    Update trk%llu:\n"
-               "        BEFORE: GLOBAL pos=(%6.2f,%6.2f) yaw=%6.3f vx=%6.3f vy=%6.3f -> LOCAL pos=(%6.2f,%6.2f) yaw=%6.3f vx=%6.3f vy=%6.3f\n"
-               "        AFTER : GLOBAL pos=(%6.2f,%6.2f) yaw=%6.3f vx=%6.3f vy=%6.3f -> LOCAL pos=(%6.2f,%6.2f) yaw=%6.3f vx=%6.3f vy=%6.3f\n",
-               trk.track_id,
-               old_x, old_y, old_yaw, old_vx, old_vy,
-               local_before_x, local_before_y, local_before_yaw, local_before_vx, local_before_vy,
-               trk.x, trk.y, trk.yaw, trk.vx, trk.vy,
-               local_after_x, local_after_y, local_after_yaw, local_after_vx, local_after_vy);
+        trk.update(det, timestamp);
     }
 
-    // 5. 创建新轨迹
     for (int idx : matchRes.unmatched_dets) {
         tracks_.emplace_back(next_id_++, world_dets[idx], timestamp);
-        const auto& new_trk = tracks_.back();
-        float local_x, local_y, local_yaw, local_vx, local_vy;
-        worldToLocal(new_trk.x, new_trk.y, new_trk.yaw,
-                     new_trk.vx, new_trk.vy,
-                     current_ego,
-                     local_x, local_y, local_yaw,
-                     local_vx, local_vy);
-        printf("    New trk%llu from det%d: GLOBAL pos=(%6.2f,%6.2f) yaw=%6.3f vx=%6.3f vy=%6.3f -> LOCAL pos=(%6.2f,%6.2f) yaw=%6.3f vx=%6.3f vy=%6.3f\n",
-               new_trk.track_id, idx,
-               new_trk.x, new_trk.y, new_trk.yaw, new_trk.vx, new_trk.vy,
-               local_x, local_y, local_yaw, local_vx, local_vy);
     }
 
-    // 6. 清理丢失过久的轨迹
     std::vector<Track> keep;
     for (auto& trk : tracks_) {
         if (trk.state == TrackState::Removed) continue;
         if (trk.time_since_update > cfg_.max_lost_frames) {
             trk.state = TrackState::Removed;
-            printf("  Remove trk%llu (lost %d frames)\n", trk.track_id, trk.time_since_update);
             continue;
         }
         keep.push_back(trk);
     }
     tracks_ = std::move(keep);
 
-    // 7. 输出确认轨迹并转回局部坐标，同时打印局部速度
     std::vector<Track> confirmed;
     for (auto& trk : tracks_) {
         if (!trk.is_confirmed()) continue;
         Track out_trk = trk;
-        if (cfg_.enable_ego_comp && current_ego.valid) {
+        if (cfg_.enable_ego_comp && ego_with_vel.valid) {
             float local_x, local_y, local_yaw, local_vx, local_vy;
-            worldToLocal(trk.x, trk.y, trk.yaw,
-                         trk.vx, trk.vy,
-                         current_ego,
-                         local_x, local_y, local_yaw,
-                         local_vx, local_vy);
-            printf("  Out trk%llu: GLOBAL vx=%6.3f vy=%6.3f -> LOCAL vx=%6.3f vy=%6.3f\n",
-                   trk.track_id, trk.vx, trk.vy, local_vx, local_vy);
-            printf("  Out trk%llu: GLOBAL pos=(%6.2f,%6.2f) yaw=%6.3f -> LOCAL pos=(%6.2f,%6.2f) yaw=%6.3f\n",
-                   trk.track_id, trk.x, trk.y, trk.yaw, local_x, local_y, local_yaw);
-            out_trk.x = local_x; out_trk.y = local_y; out_trk.yaw = local_yaw;
-            out_trk.vx = local_vx; out_trk.vy = local_vy;
+            worldToLocal(trk.x, trk.y, trk.yaw, trk.vx, trk.vy, ego_with_vel, local_x, local_y, local_yaw, local_vx, local_vy);
+            out_trk.global_vx = trk.vx;
+            out_trk.global_vy = trk.vy;
+            out_trk.vx = local_vx;
+            out_trk.vy = local_vy;
+            out_trk.x = local_x;
+            out_trk.y = local_y;
+            out_trk.yaw = local_yaw;
+        } else {
+            out_trk.global_vx = trk.vx;
+            out_trk.global_vy = trk.vy;
         }
         confirmed.push_back(out_trk);
     }
-    printf("最终输出轨迹数: %zu\n\n", confirmed.size());
     return confirmed;
 }
 

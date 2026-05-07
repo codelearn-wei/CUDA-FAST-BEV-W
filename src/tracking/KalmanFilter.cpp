@@ -8,21 +8,25 @@ namespace tracking {
 KalmanFilter::KalmanFilter() : last_x_(0.0), last_y_(0.0) {
     x_ = Eigen::VectorXd::Zero(dim_x);
     P_ = Eigen::MatrixXd::Identity(dim_x, dim_x);
-    P_.block<7,7>(0,0) *= 1.0;
-    for (int i = 7; i < dim_x; ++i) P_(i, i) = 1.0;   // 速度初始协方差增大
+    P_.block<7,7>(0,0) *= 1.0;                    // 位置起始不确定度1m
+    for (int i = 7; i < dim_x; ++i) P_(i,i) = 5.0; // 速度起始不确定度增大（让滤波器一开始就信任测量）
 
     H_ = Eigen::MatrixXd::Zero(dim_z, dim_x);
     for (int i = 0; i < 7; ++i) H_(i,i) = 1.0;
     H_(7,7) = 1.0; H_(8,8) = 1.0;
 
+    // 测量噪声：减小以更信任观测
     R_ = Eigen::MatrixXd::Identity(dim_z, dim_z);
-    R_(0,0)=0.25; R_(1,1)=0.25; R_(2,2)=0.25; R_(3,3)=0.05;
-    R_(4,4)=0.1;  R_(5,5)=0.1;  R_(6,6)=0.1;
-    R_(7,7)=0.5;  R_(8,8)=0.5;
+    R_(0,0)=0.1; R_(1,1)=0.1; R_(2,2)=0.1;       // 位置 0.32m 标准差
+    R_(3,3)=0.02;                                 // 朝向 ≈0.14 rad
+    R_(4,4)=0.05; R_(5,5)=0.05; R_(6,6)=0.05;    // 尺寸 0.22m
+    R_(7,7)=0.2; R_(8,8)=0.2;                    // 速度 0.45m/s 标准差（信任速度测量）
 
+    // 过程噪声：根据实际运动幅度设定
     Q_ = Eigen::MatrixXd::Zero(dim_x, dim_x);
-    Q_(3,3) = 0.001;
-    for (int i = 7; i < dim_x; ++i) Q_(i,i) = 0.5;   // 增加速度过程噪声
+    Q_(3,3) = 0.001;                              // 角度过程噪声
+    // 速度过程噪声：目标加速度噪声。静止目标希望速度稳定，用较小值；动态目标要适应变化，用适中值。
+    for (int i = 7; i < dim_x; ++i) Q_(i,i) = 0.1;  // 原0.5偏高，降为0.1
 }
 
 void KalmanFilter::init(const Eigen::VectorXd& bbox3d) {

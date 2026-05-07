@@ -47,6 +47,8 @@ struct EgoPose {
     double x    = 0.0;    // 全局 x（米）
     double y    = 0.0;    // 全局 y（米）
     double yaw  = 0.0;    // 全局航向角（弧度）
+    double vx   = 0.0;    // 自车全局速度 x 分量（米/秒）
+    double vy   = 0.0;    // 自车全局速度 y 分量（米/秒）
     bool   valid = false; // 是否有效
 };
 
@@ -137,6 +139,8 @@ private:
     uint64_t next_id_ = 1;
     std::vector<Track> tracks_;
     EgoPose prev_ego_pose_;   // 上一帧自车全局位姿（用于运动补偿）
+    EgoPose prev_ego_pose_for_velocity_;     // 用于速度差分
+    double  prev_timestamp_ = -1.0;          // 上一帧时间戳
 };
 
 }  // namespace tracking

@@ -54,6 +54,7 @@ public:
     TrackState state;
     float x, y, z;
     float vx, vy;
+    float global_vx, global_vy;
     float yaw;
     float w, l, h;
     float score;

@@ -332,7 +332,6 @@ static void save_boxes_json(
   }
   ofs << "]\n";
   ofs.close();
-  printf("  [JSON] 已保存 %zu 个检测框 → %s\n", boxes.size(), file_path.c_str());
 }
 
 static void save_boxes(
@@ -621,15 +620,12 @@ int main(int argc, char** argv) {
           det.vx     = box.velocity.vx;
           det.vy     = box.velocity.vy;
           det.score  = box.score;
-          det.class_id = box.id;          // 注意：Detection 中是 class_id，不是 label
+          det.class_id = box.id;
           detections.push_back(det);
       }
 
       // 更新跟踪器，得到轨迹（传入 ego 位姿以启用运动补偿）
       auto tracks = tracker.update(detections, timestamp, ego_pose);
-
-      // 可选：输出跟踪结果（打印或保存到文件）
-      // printf("帧 %s: 检测框 %zu, 跟踪轨迹 %zu\n", frame_name.c_str(), boxes.size(), tracks.size());
 
       // 为每一帧保存轨迹到单独文件（例如 result_tracks.json）
       if (cfg.output_format == "json") {
@@ -643,7 +639,8 @@ int main(int argc, char** argv) {
                   << "\"position\": [" << trk.x << ", " << trk.y << ", " << trk.z << "], "
                   << "\"size\": [" << trk.w << ", " << trk.l << ", " << trk.h << "], "
                   << "\"yaw\": " << trk.yaw << ", "
-                  << "\"velocity\": [" << trk.vx << ", " << trk.vy << "]"
+                  << "\"velocity\": [" << trk.vx << ", " << trk.vy << "], "      // 局部速度
+                  << "\"global_velocity\": [" << trk.global_vx << ", " << trk.global_vy << "]"   // 全局速度
                   << "}";
               if (i != tracks.size() - 1) ofs << ",";
               ofs << "\n";
