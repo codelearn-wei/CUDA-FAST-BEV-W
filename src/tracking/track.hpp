@@ -55,6 +55,7 @@ public:
     float x, y, z;
     float vx, vy;
     float global_vx, global_vy;
+    float global_x, global_y, global_yaw;
     float yaw;
     float w, l, h;
     float score;
@@ -82,20 +83,11 @@ public:
 
     // 更新（匹配到新检测）
     void update(const Detection& det, double timestamp = 0.0) {
-        // 已经移除了 π 歧义修正
-        float det_yaw = det.yaw;
-        Eigen::VectorXd z(9);
-        z << det.x, det.y, det.z, det_yaw, det.l, det.w, det.h, det.vx, det.vy;
+        // 直接传递 7 维可靠观测（位置、航向、尺寸）
+        Eigen::VectorXd z(7);
+        z << det.x, det.y, det.z, det.yaw, det.l, det.w, det.h;
         kf_.update(z);
         syncFromKF();
-
-        // ========== 速度融合（关键修复）==========
-        // 检测速度已经处于局部坐标系（x右, y前），直接使用
-        const float alpha = 0.6f;       // 检测速度权重，可根据噪声调整
-        vx = alpha * det.vx + (1.0f - alpha) * vx;
-        vy = alpha * det.vy + (1.0f - alpha) * vy;
-        // 可选：同时更新卡尔曼滤波器中的速度状态（保持一致性）
-        // 但 KF 内部速度不参与测量更新，直接覆盖可能导致不一致，因此只更新 Track 成员变量即可
 
         hits++;
         age++;
@@ -221,13 +213,13 @@ private:
 
     KalmanFilter kf_;   // 卡尔曼滤波器实例
 
-    // 从 KF 同步成员变量
+    // 从 KF 同步成员变量（重要修改点）
     void syncFromKF() {
         Eigen::VectorXd state = kf_.getState();      // 7 维: x,y,z,theta,l,w,h
         x   = static_cast<float>(state(0));
         y   = static_cast<float>(state(1));
         z   = static_cast<float>(state(2));
-        // 角度归一化到 (-π, π]，避免 KF 内部线性融合使 yaw 漂移到 ±π 边界两侧
+        // 角度归一化到 (-π, π]
         {
             float raw = static_cast<float>(state(3));
             while (raw >  static_cast<float>(M_PI)) raw -= 2.0f * static_cast<float>(M_PI);
@@ -238,12 +230,16 @@ private:
         w   = static_cast<float>(state(5));
         h   = static_cast<float>(state(6));
 
-        Eigen::VectorXd vel = kf_.getVelocity();     // 3 维: dx,dy,dz
-        vx  = static_cast<float>(vel(0));
-        vy  = static_cast<float>(vel(1));
-        // vz 忽略（Track 中无此字段）
+        // 从完整状态中获取 v（沿航向速率）
+        Eigen::VectorXd full_state = kf_.getFullState();  // 10 维
+        float v_along = static_cast<float>(full_state(7)); // 索引 7 是 v
+        // 计算全局速度分量
+        float cos_yaw = std::cos(yaw);
+        float sin_yaw = std::sin(yaw);
+        vx = v_along * cos_yaw;
+        vy = v_along * sin_yaw;
+        // global_vx/vy 在输出时会被 tracker 填充，这里无需处理
     }
-
 };
 
 }  // namespace tracking

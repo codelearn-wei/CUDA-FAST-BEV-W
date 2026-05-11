@@ -1,39 +1,15 @@
 /**
  * joint_inference.cpp — BEV + MapTR 联合感知主程序
+ * (修改版：使用新版 tracking 模块)
  *
- * 功能：
- *   1. 图像预处理（从帧目录 / 原始图像）
- *   2. BEV 3D 目标检测 + 多目标跟踪（C++ / TensorRT）
- *   3. MapTR HD 地图推理（通过 Python subprocess）
- *   4. 联合结果保存（JSON）
- *
- * 用法：
- *   ./build/joint_inference <frames_dir> <model> [precision] [options]
- *
- * 必选参数：
- *   frames_dir    帧目录（frame_XXXXX 子目录，由 nuscenes_adapter.py 生成）
- *   model         模型名称（resnet18 / resnet18int8）
- *
- * 可选参数：
- *   precision         fp16 / int8（默认 fp16）
- *   --score-thr F     置信度阈值（默认 0.35）
- *   --map-mode S      地图模式：auto / gt / model / trajectory（默认 auto）
- *   --nuscenes-dir S  NuScenes 数据目录（GT 模式需要，默认 data/nuscenes）
- *   --skip-map        仅运行 BEV，跳过 MapTR
- *   --skip-bev        仅运行 MapTR，跳过 BEV（结合 --map-mode 使用）
- *   --save-json       将联合结果写入 <frame_dir>/joint_result.json
- *   --batch           批量处理所有帧（默认为批量模式）
- *   --no-warmup       跳过 TRT warmup
- *   --verbose         打印详细调试信息
- *
- * 示例：
- *   # 批量推理（BEV + GT 地图）
- *   ./build/joint_inference outputs/frames resnet18int8 int8 \
- *       --score-thr 0.3 --map-mode gt --save-json
- *
- *   # 仅 BEV（不运行 MapTR）
- *   ./build/joint_inference outputs/frames resnet18int8 int8 \
- *       --score-thr 0.3 --skip-map
+ * 用法及参数说明与原版相同，新增以下跟踪选项：
+ *   --track-threshold F  关联阈值（默认 -0.4）
+ *   --track-metric S     度量方式：giou_3d / dist_3d / iou_3d / mahalanobis（默认 giou_3d）
+ *   --track-max-lost N   最大丢失帧数（默认 3）
+ *   --track-dt F         帧间预期时间差（秒，默认 0.5）
+ *   --track-algo S       匹配算法：greedy / hungarian（默认 greedy）
+ *   --track-min-hits N   最小命中数（默认 3）
+ *   --track-ego-comp N   是否启用 ego 运动补偿（1/0，默认 1）
  */
 
 #include "perception/perception_types.hpp"
@@ -41,6 +17,8 @@
 #include "perception/map_runner.hpp"
 #include "pipeline/perception_pipeline.hpp"
 #include "camera/camera_frame.hpp"
+#include "tracking/tracker.hpp"   // 新版跟踪器
+#include "tracking/track.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -92,7 +70,65 @@ static std::vector<std::string> collect_frame_dirs(const std::string& base)
     return dirs;
 }
 
-// 将 JointPerceptionResult 序列化为 JSON 字符串
+// 从 meta.json 读取 ego 位姿（全局坐标）和时间戳
+static fastbev::tracking::EgoPose read_ego_pose(const std::string& frame_dir, double& timestamp_sec)
+{
+    fastbev::tracking::EgoPose pose;
+    timestamp_sec = 0.0;
+    std::string meta_path = frame_dir + "/meta.json";
+    std::ifstream f(meta_path);
+    if (!f.is_open()) return pose;
+    std::string content((std::istreambuf_iterator<char>(f)),
+                         std::istreambuf_iterator<char>());
+    f.close();
+
+    // 辅助 lambda：提取 "key": value
+    auto get_double = [&](const std::string& key, double def=0.0) -> double {
+        std::string pat = "\"" + key + "\"";
+        size_t kp = content.find(pat);
+        if (kp == std::string::npos) return def;
+        size_t vp = content.find_first_of("-0123456789", kp + pat.size());
+        if (vp == std::string::npos) return def;
+        try { return std::stod(content.substr(vp)); } catch(...) { return def; }
+    };
+    auto get_array3 = [&](const std::string& key, double out[3]) -> bool {
+        std::string pat = "\"" + key + "\"";
+        size_t kp = content.find(pat);
+        if (kp == std::string::npos) return false;
+        size_t lb = content.find('[', kp + pat.size());
+        size_t rb = content.find(']', lb);
+        if (lb == std::string::npos || rb == std::string::npos) return false;
+        std::string arr = content.substr(lb+1, rb-lb-1);
+        int idx = 0;
+        size_t pos = 0;
+        while (idx < 3 && pos < arr.size()) {
+            size_t sp = arr.find_first_of("-0123456789", pos);
+            if (sp == std::string::npos) break;
+            try {
+                size_t end = 0;
+                out[idx++] = std::stod(arr.substr(sp), &end);
+                pos = sp + end;
+            } catch(...) { break; }
+        }
+        return idx == 3;
+    };
+
+    double trans[3] = {0,0,0};
+    if (get_array3("ego_translation_global", trans)) {
+        pose.x = trans[0];
+        pose.y = trans[1];
+    }
+    pose.yaw   = get_double("ego_yaw_global", 0.0);
+    pose.valid = true;
+
+    // 读取时间戳（微秒），转换为秒
+    int64_t ts_us = static_cast<int64_t>(get_double("timestamp_us", 0.0));
+    if (ts_us == 0) ts_us = static_cast<int64_t>(get_double("timestamp", 0.0));
+    timestamp_sec = static_cast<double>(ts_us) / 1e6;
+    return pose;
+}
+
+// 将 JointPerceptionResult 序列化为 JSON 字符串（格式与原版完全相同）
 static std::string result_to_json(const JointPerceptionResult& r)
 {
     std::ostringstream o;
@@ -138,7 +174,7 @@ static std::string result_to_json(const JointPerceptionResult& r)
     }
     o << "  ],\n";
 
-    // map（直接嵌入原始 JSON）
+    // map
     if (r.map.is_valid() && !r.map.raw_json.empty()) {
         o << "  \"map\": " << r.map.raw_json << "\n";
     } else {
@@ -165,13 +201,19 @@ static void print_usage(const char* prog)
         "  --score-thr F        置信度阈值（默认 0.35）\n"
         "  --map-mode S         auto|gt|model（默认 auto）\n"
         "  --ckpt PATH          MapTR checkpoint 路径\n"
-        "                       （默认 model/maptr/maptr_nano_r18_110e.pth）\n"
         "  --nuscenes-dir S     NuScenes 数据目录（默认 data/nuscenes）\n"
         "  --skip-map           仅运行 BEV，跳过 MapTR\n"
         "  --skip-bev           仅运行 MapTR，跳过 BEV\n"
         "  --save-json          保存联合结果到 <frame_dir>/joint_result.json\n"
         "  --no-warmup          跳过 TRT warmup\n"
         "  --verbose            打印详细信息\n"
+        "  --track-threshold F  跟踪关联阈值（默认 -0.4）\n"
+        "  --track-metric S     度量方式：giou_3d/dist_3d/iou_3d/mahalanobis（默认 giou_3d）\n"
+        "  --track-max-lost N   最大丢失帧数（默认 3）\n"
+        "  --track-dt F         帧间预期时间差（秒，默认 0.5）\n"
+        "  --track-algo S       匹配算法：greedy/hungarian（默认 greedy）\n"
+        "  --track-min-hits N   最小命中数（默认 3）\n"
+        "  --track-ego-comp N   启用 ego 运动补偿（1/0，默认 1）\n"
         "\n"
         "说明（并行模式）:\n"
         "  BEV 在主线程逐帧推理；MapTR 在后台线程同时处理所有帧。\n"
@@ -206,7 +248,7 @@ int main(int argc, char** argv)
     std::string model_name = argv[2];
     std::string precision  = "fp16";
 
-    // ── 解析可选参数 ──────────────────────────────────────────────────────
+    // ── 解析可选参数（包含跟踪配置）────────────────────────────────────────
     float       score_thr    = 0.35f;
     std::string map_mode     = "auto";
     std::string nuscenes_dir = "data/nuscenes";
@@ -216,6 +258,15 @@ int main(int argc, char** argv)
     bool        save_json    = false;
     bool        no_warmup    = false;
     bool        verbose      = false;
+
+    // 跟踪参数（新版tracking使用）
+    float       track_threshold  = -0.4f;
+    std::string track_metric_str = "giou_3d";
+    int         track_max_lost   = 3;
+    float       track_dt         = 0.5f;
+    std::string track_algo_str   = "greedy";
+    int         track_min_hits   = 3;
+    bool        track_ego_comp   = true;
 
     for (int i = 3; i < argc; ++i) {
         if (!argv[i]) continue;
@@ -237,8 +288,22 @@ int main(int argc, char** argv)
             no_warmup = true;
         } else if (str_eq(argv[i], "--verbose")) {
             verbose = true;
+        } else if (str_eq(argv[i], "--track-threshold") && i + 1 < argc) {
+            track_threshold = static_cast<float>(atof(argv[++i]));
+        } else if (str_eq(argv[i], "--track-metric") && i + 1 < argc) {
+            track_metric_str = argv[++i];
+        } else if (str_eq(argv[i], "--track-max-lost") && i + 1 < argc) {
+            track_max_lost = atoi(argv[++i]);
+        } else if (str_eq(argv[i], "--track-dt") && i + 1 < argc) {
+            track_dt = static_cast<float>(atof(argv[++i]));
+        } else if (str_eq(argv[i], "--track-algo") && i + 1 < argc) {
+            track_algo_str = argv[++i];
+        } else if (str_eq(argv[i], "--track-min-hits") && i + 1 < argc) {
+            track_min_hits = atoi(argv[++i]);
+        } else if (str_eq(argv[i], "--track-ego-comp") && i + 1 < argc) {
+            track_ego_comp = (atoi(argv[++i]) != 0);
         } else if (!str_eq(argv[i], "--batch")) {
-            // precision 参数（fp16 / int8）
+            // precision 参数
             if (argv[i][0] != '-')
                 precision = argv[i];
         }
@@ -262,6 +327,9 @@ int main(int argc, char** argv)
         printf("  地图模式: 跳过\n");
     }
     printf("  保存 JSON: %s\n", save_json ? "是" : "否");
+    printf("  跟踪参数: thr=%.2f, metric=%s, max_lost=%d, dt=%.2f, algo=%s, min_hits=%d, ego_comp=%d\n",
+           track_threshold, track_metric_str.c_str(), track_max_lost, track_dt,
+           track_algo_str.c_str(), track_min_hits, track_ego_comp);
     printf("\n");
 
     // ── Step 1: 收集帧目录列表 ────────────────────────────────────────────
@@ -273,15 +341,15 @@ int main(int argc, char** argv)
     }
     printf("共找到 %zu 帧\n\n", frame_dirs.size());
 
-    // ── Step 2: 初始化 BEV 感知管线 ──────────────────────────────────────
+    // ── Step 2: 初始化 BEV 感知管线（禁用其内部跟踪）──────────────────────
     std::unique_ptr<PerceptionPipeline> bev_pipeline;
     if (!skip_bev) {
         PipelineConfig cfg;
         cfg.model_name      = model_name;
         cfg.precision       = precision;
         cfg.score_thr       = score_thr;
-        cfg.enable_tracking = true;
-        cfg.save_output     = save_json;
+        cfg.enable_tracking = false;   // 禁用旧版跟踪，使用新版
+        cfg.save_output     = false;   // 我们手动保存
         cfg.output_dir      = frames_dir;
         cfg.output_format   = "json";
         cfg.verbose         = verbose;
@@ -303,27 +371,23 @@ int main(int argc, char** argv)
                 bev_pipeline->process(*warm_frame_ptr);
                 camera::FrameLoader::free_frame(*warm_frame_ptr);
             }
-            // 重置跟踪器，warmup 帧不计入跟踪
-            bev_pipeline->reset_tracker();
+            // 重置跟踪器（新版tracker在后续循环中单独创建，无需重置）
             printf("[BEV] Warmup 完成\n");
         }
     }
 
     // ── Step 3: 初始化 MapRunner，后台线程并行运行 MapTR ─────────────────
-    // MapTR 在独立线程里通过 Python subprocess 执行，与主线程的 BEV 推理同时进行。
-    // 两者资源分离（MapTR 主要占用 Python 进程 / CPU，BEV 使用 TensorRT / GPU），
-    // 实际墙钟耗时约等于 max(BEV 总耗时, MapTR 总耗时)。
     std::unique_ptr<MapRunner> map_runner;
     std::thread      map_thread;
-    std::atomic<int> map_batch_count{-99};   // -99 = 未启动
-    double           map_thread_ms = 0.0;    // MapTR 线程墙钟耗时（ms）
+    std::atomic<int> map_batch_count{-99};
+    double           map_thread_ms = 0.0;
 
     if (!skip_map) {
         MapRunnerConfig mcfg;
         mcfg.mode          = map_mode;
         mcfg.frames_dir    = frames_dir;
         mcfg.nuscenes_dir  = nuscenes_dir;
-        mcfg.ckpt_path     = ckpt_path;   // model 模式使用
+        mcfg.ckpt_path     = ckpt_path;
         mcfg.score_thr     = score_thr;
         mcfg.verbose       = verbose;
 
@@ -333,7 +397,6 @@ int main(int argc, char** argv)
                map_mode.c_str());
         printf("[MapTR] BEV 每帧取最新可用结果（无结果时复用上一帧），不等待 MapTR。\n");
 
-        // 启动后台线程：run_batch() 内部调用 Python subprocess（阻塞直到完成）
         map_thread = std::thread([&map_runner, &map_batch_count, &map_thread_ms]() {
             auto t0 = std::chrono::high_resolution_clock::now();
             map_batch_count.store(map_runner->run_batch(/*overwrite=*/false));
@@ -345,27 +408,45 @@ int main(int argc, char** argv)
         });
     }
 
-    // ── Step 4: BEV 逐帧推理（与 MapTR 线程同时进行） ────────────────────
-    // BEV 不等待 MapTR：每帧尝试读取 map_result.json，
-    // 若当帧尚未写入（MapTR 还没处理到），则复用上一帧的 map 结果。
+    // ── Step 4: 初始化新版跟踪器 ──────────────────────────────────────────
+    fastbev::tracking::MetricType metric = fastbev::tracking::MetricType::GIOU_3D;
+    if (track_metric_str == "dist_3d") metric = fastbev::tracking::MetricType::DIST_3D;
+    else if (track_metric_str == "iou_3d") metric = fastbev::tracking::MetricType::IOU_3D;
+    else if (track_metric_str == "mahalanobis") metric = fastbev::tracking::MetricType::MAHALANOBIS;
+
+    fastbev::tracking::AlgoType algo;
+    if (track_algo_str == "hungarian") algo = fastbev::tracking::AlgoType::HUNGARIAN;
+    else algo = fastbev::tracking::AlgoType::GREEDY;
+
+    fastbev::tracking::TrackerConfig tracker_cfg;
+    tracker_cfg.threshold       = track_threshold;
+    tracker_cfg.metric          = metric;
+    tracker_cfg.max_lost_frames = track_max_lost;
+    tracker_cfg.dt              = track_dt;
+    tracker_cfg.algo            = algo;
+    tracker_cfg.min_hits        = track_min_hits;
+    tracker_cfg.enable_ego_comp = track_ego_comp;
+
+    fastbev::tracking::Tracker tracker(tracker_cfg);
+
+    // ── Step 5: BEV 逐帧推理（与 MapTR 线程同时进行） ────────────────────
     size_t total_frames  = frame_dirs.size();
     size_t bev_ok        = 0;
     double bev_total_ms  = 0.0;
     auto   bev_wall_t0   = std::chrono::high_resolution_clock::now();
-    MapResult last_map;   // 最近一次成功读取的 map 结果（供回退使用）
-    int       map_hits   = 0;  // 当帧有新结果的帧数
-    int       map_stale  = 0;  // 使用上一帧结果（MapTR 未就绪）的帧数
+    MapResult last_map;   // 最近一次成功读取的 map 结果
+    int       map_hits   = 0;
+    int       map_stale  = 0;
 
     for (size_t fi = 0; fi < total_frames; ++fi) {
         const std::string& fdir = frame_dirs[fi];
 
-        // ── 4a. 图像预处理（加载帧数据） ─────────────────────────────────
+        // ── 5a. 图像预处理（加载帧数据） ─────────────────────────────────
         camera::CameraFrame bev_frame;
         RawImageInput       map_input;
 
         bool prep_ok = ImagePreprocessor::from_frame_dir(
             fdir, static_cast<uint64_t>(fi), bev_frame, map_input);
-
         if (!prep_ok) {
             fprintf(stderr, "[joint_inference] 跳过帧（预处理失败）: %s\n",
                     fdir.c_str());
@@ -376,79 +457,100 @@ int main(int argc, char** argv)
         joint.frame_id  = bev_frame.frame_id;
         joint.timestamp = bev_frame.timestamp;
 
-        // ── 4b. BEV 推理 + 跟踪 ──────────────────────────────────────────
+        // ── 5b. BEV 推理（仅检测，无跟踪） ───────────────────────────────
+        PerceptionResult pr;
         if (!skip_bev && bev_pipeline) {
             auto t0 = std::chrono::high_resolution_clock::now();
-            PerceptionResult pr = bev_pipeline->process(bev_frame);
+            pr = bev_pipeline->process(bev_frame);
             auto t1 = std::chrono::high_resolution_clock::now();
             double lat = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
             joint.detections   = pr.detections;
-            joint.tracks       = pr.tracks;
-            joint.bev_latency_ms = lat;
             bev_total_ms += lat;
             ++bev_ok;
 
             if (verbose) {
-                printf("[BEV] frame %04zu  det=%zu  track=%zu  lat=%.1fms\n",
-                       fi, pr.detections.size(), pr.tracks.size(), lat);
-            }
-
-            // 将 tracks.json 写入帧目录（兼容 tracking_demo 的现有格式）
-            if (save_json) {
-                std::string track_path = fdir + "/tracks.json";
-                std::ofstream tf(track_path);
-                tf << "[\n";
-                for (size_t ti = 0; ti < pr.tracks.size(); ++ti) {
-                    const auto& t = pr.tracks[ti];
-                    tf << "  {\"track_id\": " << t.track_id
-                       << ", \"position\": [" << t.x << ", " << t.y << ", " << t.z << "]"
-                       << ", \"size\": [" << t.w << ", " << t.l << ", " << t.h << "]"
-                       << ", \"yaw\": " << t.yaw
-                       << ", \"velocity\": [" << t.vx << ", " << t.vy << "]"
-                       << ", \"score\": " << t.score
-                       << ", \"class_id\": " << t.class_id
-                       << "}";
-                    if (ti + 1 < pr.tracks.size()) tf << ",";
-                    tf << "\n";
-                }
-                tf << "]\n";
+                printf("[BEV] frame %04zu  det=%zu  lat=%.1fms\n",
+                       fi, pr.detections.size(), lat);
             }
         }
 
-        // ── 4c. 读取 MapTR 最新可用结果 ──────────────────────────────────
-        // 非阻塞：read_result 直接读文件，若文件不存在返回 false；
-        // 此时使用 last_map（上一帧或更早写入的结果），BEV 绝不等待。
+        // ── 5c. 新版跟踪：将检测框转换为 Detection 并更新 tracker ────────
+        std::vector<fastbev::tracking::Detection> detections;
+        for (const auto& box : joint.detections) {
+            fastbev::tracking::Detection det;
+            det.x      = box.x;
+            det.y      = box.y;
+            det.z      = box.z;
+            det.w      = box.w;
+            det.l      = box.l;
+            det.h      = box.h;
+            det.yaw    = box.yaw;
+            det.vx     = box.vx;   // 检测框速度可能为0，后续由卡尔曼滤波估计
+            det.vy     = box.vy;
+            det.score  = box.score;
+            det.class_id = box.class_id;
+            detections.push_back(det);
+        }
+
+        // 读取 ego 位姿和时间戳
+        double timestamp_sec = 0.0;
+        fastbev::tracking::EgoPose ego_pose = read_ego_pose(fdir, timestamp_sec);
+        // 如果时间戳无效，回退到 bev_frame.timestamp（微秒转秒）
+        if (timestamp_sec < 1e-5 && bev_frame.timestamp > 0) {
+            timestamp_sec = static_cast<double>(bev_frame.timestamp) / 1e6;
+        }
+
+        // 更新跟踪器，获得当前帧轨迹
+        auto tracks = tracker.update(detections, timestamp_sec, ego_pose);
+        joint.tracks = tracks;   // 直接赋值，joint.tracks 类型已是 std::vector<fastbev::tracking::Track>
+
+        // ── 5d. 读取 MapTR 最新可用结果（同原逻辑）────────────────────────
         if (!skip_map && map_runner) {
             MapResult cur_map;
             auto t0 = std::chrono::high_resolution_clock::now();
             bool got = map_runner->read_result(fdir, cur_map);
             auto t1 = std::chrono::high_resolution_clock::now();
-
             if (got) {
-                last_map = cur_map;       // 更新最新缓存
+                last_map = cur_map;
                 joint.map = cur_map;
                 ++map_hits;
             } else if (last_map.is_valid()) {
-                joint.map = last_map;     // 复用上一帧结果
+                joint.map = last_map;
                 ++map_stale;
             }
             joint.map_latency_ms =
                 std::chrono::duration<double, std::milli>(t1 - t0).count();
-
             if (verbose) {
                 printf("[MAP] frame %04zu  %s  elems=%zu\n",
-                       fi,
-                       got ? "新结果" : "复用缓存",
-                       joint.map.elements.size());
+                       fi, got ? "新结果" : "复用缓存", joint.map.elements.size());
             }
         }
 
-        // ── 4d. 保存联合结果 ──────────────────────────────────────────────
+        // ── 5e. 保存联合结果及单独的轨迹文件（JSON 格式与原版一致）────────
         if (save_json) {
             std::string jpath = fdir + "/joint_result.json";
             std::ofstream jf(jpath);
             jf << result_to_json(joint);
+
+            // 保存单独的 tracks.json，格式与原版相同
+            std::string track_path = fdir + "/tracks.json";
+            std::ofstream tf(track_path);
+            tf << "[\n";
+            for (size_t ti = 0; ti < joint.tracks.size(); ++ti) {
+                const auto& t = joint.tracks[ti];
+                tf << "  {\"track_id\": " << t.track_id
+                   << ", \"position\": [" << t.x << ", " << t.y << ", " << t.z << "]"
+                   << ", \"size\": [" << t.w << ", " << t.l << ", " << t.h << "]"
+                   << ", \"yaw\": " << t.yaw
+                   << ", \"velocity\": [" << t.vx << ", " << t.vy << "]"
+                   << ", \"score\": " << t.score
+                   << ", \"class_id\": " << t.class_id
+                   << "}";
+                if (ti + 1 < joint.tracks.size()) tf << ",";
+                tf << "\n";
+            }
+            tf << "]\n";
         }
 
         // 打印进度
@@ -457,7 +559,7 @@ int main(int argc, char** argv)
             fflush(stdout);
         }
 
-        // 释放 BEV 帧内存（图像由 stb_image 分配，张量由 FrameLoader 分配）
+        // 释放 BEV 帧内存
         camera::FrameLoader::free_frame(bev_frame);
     }
     auto bev_wall_t1 = std::chrono::high_resolution_clock::now();
@@ -465,17 +567,16 @@ int main(int argc, char** argv)
         std::chrono::duration<double, std::milli>(bev_wall_t1 - bev_wall_t0).count();
     printf("\n");
 
-    // ── Step 5: 等待 MapTR 线程完成 ───────────────────────────────────────
+    // ── Step 6: 等待 MapTR 线程完成 ───────────────────────────────────────
     if (map_thread.joinable()) {
         if (map_batch_count.load() == -99) {
-            // MapTR 仍在运行，BEV 已经结束
             printf("[BEV 已完成，等待 MapTR 线程结束...]\n");
             fflush(stdout);
         }
         map_thread.join();
     }
 
-    // ── Step 6: 并行耗时统计 ──────────────────────────────────────────────
+    // ── Step 7: 并行耗时统计 ──────────────────────────────────────────────
     printf("\n");
     printf("╔══════════════════════════════════════════╗\n");
     printf("║         并行推理耗时统计                 ║\n");
@@ -498,7 +599,6 @@ int main(int argc, char** argv)
             printf("║  MapTR 墙钟   : %8.1f ms               ║\n",
                    map_thread_ms);
         }
-        // 最新结果统计：当帧命中 vs 使用上帧缓存
         printf("║  BEV 命中新图 : %4d 帧 / 复用缓存: %3d 帧  ║\n",
                map_hits, map_stale);
     }

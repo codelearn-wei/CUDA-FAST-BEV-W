@@ -1,4 +1,3 @@
-
 /*
  * CUDA-FastBEV 推理入口
  *
@@ -118,6 +117,28 @@ static fastbev::tracking::EgoPose read_ego_pose(const std::string& frame_dir)
     pose.yaw   = json_get_double(content, "ego_yaw_global", 0.0);
     pose.valid = true;  // meta.json 存在即视为有效
     return pose;
+}
+
+/// 从 frame_dir/meta.json 中读取 timestamp 字段，并转换为秒
+static double read_timestamp(const std::string& frame_dir)
+{
+    std::string meta_path = frame_dir + "/meta.json";
+    std::ifstream f(meta_path);
+    if (!f.is_open()) return 0.0;
+    std::string content((std::istreambuf_iterator<char>(f)),
+                         std::istreambuf_iterator<char>());
+    f.close();
+    // 查找 "timestamp":
+    std::string key = "\"timestamp\"";
+    size_t pos = content.find(key);
+    if (pos == std::string::npos) return 0.0;
+    // 找到数字起始位置
+    pos = content.find_first_of("0123456789", pos + key.size());
+    if (pos == std::string::npos) return 0.0;
+    char* end = nullptr;
+    double ts = std::strtod(content.c_str() + pos, &end);
+    // 原始单位是微秒，转换为秒
+    return ts / 1e6;
 }
 
 // ─── 命令行参数结构 ────────────────────────────────────────────────────────
@@ -567,8 +588,6 @@ int main(int argc, char** argv) {
     }
 
     int total_boxes = 0;
-    double timestamp = 0.0;
-    double fps = 2.0;
 
     for (const auto& fdir : frame_dirs) {
       std::string data_root = resolve_data_root(fdir);
@@ -577,6 +596,8 @@ int main(int argc, char** argv) {
 
       // 读取当前帧的 ego 全局位姿（用于 ego 运动补偿）
       fastbev::tracking::EgoPose ego_pose = read_ego_pose(fdir);
+      // 读取真实时间戳（秒）
+      double timestamp = read_timestamp(fdir);
 
       // 执行推理
       auto images = load_images(data_root);
@@ -624,7 +645,7 @@ int main(int argc, char** argv) {
           detections.push_back(det);
       }
 
-      // 更新跟踪器，得到轨迹（传入 ego 位姿以启用运动补偿）
+      // 更新跟踪器，得到轨迹（传入真实时间戳和 ego 位姿）
       auto tracks = tracker.update(detections, timestamp, ego_pose);
 
       // 为每一帧保存轨迹到单独文件（例如 result_tracks.json）
@@ -637,10 +658,12 @@ int main(int argc, char** argv) {
               ofs << "  {"
                   << "\"track_id\": " << trk.track_id << ", "
                   << "\"position\": [" << trk.x << ", " << trk.y << ", " << trk.z << "], "
+                  << "\"global_position\": [" << trk.global_x << ", " << trk.global_y << ", " << trk.z << "], "
                   << "\"size\": [" << trk.w << ", " << trk.l << ", " << trk.h << "], "
                   << "\"yaw\": " << trk.yaw << ", "
-                  << "\"velocity\": [" << trk.vx << ", " << trk.vy << "], "      // 局部速度
-                  << "\"global_velocity\": [" << trk.global_vx << ", " << trk.global_vy << "]"   // 全局速度
+                  << "\"global_yaw\": " << trk.global_yaw << ", "
+                  << "\"velocity\": [" << trk.vx << ", " << trk.vy << "], "
+                  << "\"global_velocity\": [" << trk.global_vx << ", " << trk.global_vy << "]"
                   << "}";
               if (i != tracks.size() - 1) ofs << ",";
               ofs << "\n";
@@ -648,8 +671,6 @@ int main(int argc, char** argv) {
           ofs << "]\n";
           ofs.close();
       }
-
-      timestamp += 1.0 / fps;
     }
 
     printf("批量完成: 共 %zu 帧，总检测框 %d 个\n", frame_dirs.size(), total_boxes);
@@ -683,4 +704,3 @@ int main(int argc, char** argv) {
   checkRuntime(cudaStreamDestroy(stream));
   return 0;
 }
-

@@ -7,28 +7,28 @@ namespace tracking {
 
 class KalmanFilter {
 public:
-    static const int dim_x = 10;   // x,y,z,theta,l,w,h,dx,dy,dz
-    static const int dim_z = 9;    // x,y,z,theta,l,w,h
+    static const int dim_x = 10;   // x,y,z,theta,l,w,h,v,omega,vz
+    static const int dim_z = 7;    // 仅观测 x,y,z,theta,l,w,h（不含速度）
 
     KalmanFilter();
 
-    // 初始化状态（首次检测，7维测量）
+    // 初始化状态（首次检测，7维测量：x,y,z,theta,l,w,h）
     void init(const Eigen::VectorXd& bbox3d);
 
     // 预测（dt: 时间间隔秒）
     void predict(double dt);
 
-    // 更新（测量值 z: 7维）
+    // 更新（测量值 z: 应为9维或7维，内部自动取前7维可靠观测）
     void update(const Eigen::VectorXd& z);
 
     // 计算创新矩阵 S = H*P*H' + R（用于马氏距离关联）
     Eigen::MatrixXd computeInnovationMatrix() const;
 
-    // 获取当前状态（前7维）
+    // 获取当前状态（前7维：x,y,z,theta,l,w,h）
     Eigen::VectorXd getState() const { return x_.head(7); }
 
-    // 获取速度（dx, dy, dz）
-    Eigen::VectorXd getVelocity() const { return x_.tail(3); }
+    // 获取速度（状态中的 v, omega, vz，注意不是 vx,vy）
+    Eigen::VectorXd getVelocity() const { return x_.segment<3>(7); }
 
     // 获取完整状态向量（调试用）
     Eigen::VectorXd getFullState() const { return x_; }
@@ -36,7 +36,7 @@ public:
     // 角度归一化到 [-π, π)
     static double normalizeAngle(double theta);
 
-    // 计算马氏距离（给定测量值 z）
+    // 计算马氏距离（给定测量值 z，内部自动使用前7维）
     double mahalanobisDistance(const Eigen::VectorXd& z) const;
 
     /**
@@ -55,7 +55,7 @@ private:
     Eigen::MatrixXd Q_;      // 过程噪声 (10x10)
     Eigen::MatrixXd R_;      // 测量噪声 (7x7)
 
-    // 用于静止抑制的成员变量（每个KalmanFilter实例独立记录）
+    // 用于静止抑制的成员变量
     double last_x_ = 0.0;
     double last_y_ = 0.0;
 };

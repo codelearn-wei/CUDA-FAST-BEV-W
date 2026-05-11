@@ -4,9 +4,8 @@ import matplotlib.patches as patches
 import os
 import json
 import re
-import subprocess
+import cv2
 import shutil
-import glob
 from collections import defaultdict
 
 # ─── 地图元素颜色（对应 MapElementType: 0=Divider, 1=Boundary, 2=PedCrossing）
@@ -156,68 +155,11 @@ def get_color_for_id(track_id, cmap_name='tab20'):
 def round_to_even(number):
     return int(np.ceil(number / 2) * 2)
 
-def create_video_with_ffmpeg_simple(frame_pattern, output_video, fps=6, bitrate="50M"):
-    try:
-        frames = sorted(glob.glob(frame_pattern.replace('%06d', '*')))
-        if not frames:
-            print("No frames found!")
-            return False
-        first_frame = frames[0]
-        probe_cmd = [
-            'ffprobe', '-v', 'error', '-select_streams', 'v:0',
-            '-show_entries', 'stream=width,height', '-of', 'csv=p=0:s=x',
-            first_frame
-        ]
-        result = subprocess.run(probe_cmd, capture_output=True, text=True)
-        if result.returncode == 0 and 'x' in result.stdout:
-            width, height = map(int, result.stdout.strip().split('x'))
-            width = round_to_even(width)
-            height = round_to_even(height)
-            scale_filter = f"scale={width}:{height},setsar=1"
-        else:
-            scale_filter = "scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1"
-        cmd = [
-            'ffmpeg', '-y',
-            '-framerate', str(fps),
-            '-i', frame_pattern,
-            '-vf', scale_filter,
-            '-c:v', 'libx264',
-            '-b:v', bitrate,
-            '-minrate', bitrate,
-            '-maxrate', bitrate,
-            '-bufsize', '10M',
-            '-profile:v', 'high',
-            '-level', '5.1',
-            '-pix_fmt', 'yuv420p',
-            '-movflags', '+faststart',
-            output_video
-        ]
-        print(f"Running FFmpeg: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"FFmpeg error: {result.stderr}")
-            return False
-        verify_cmd = [
-            'ffprobe', '-v', 'error',
-            '-select_streams', 'v:0',
-            '-show_entries', 'stream=bit_rate',
-            '-of', 'default=noprint_wrappers=1:nokey=1',
-            output_video
-        ]
-        verify_result = subprocess.run(verify_cmd, capture_output=True, text=True)
-        if verify_result.stdout.strip():
-            actual_bitrate = int(verify_result.stdout.strip()) / 1000000
-            print(f"✅ Video bitrate: {actual_bitrate:.2f} Mbps")
-        return True
-    except Exception as e:
-        print(f"Error: {e}")
-        return False
-
 def visualize_tracking_from_json(frames_dir, output_video_path, fps=6, dpi=400, figsize=(16, 16),
                                   bitrate="50M", xlim=None, ylim=None, use_joint_result=False,
                                   yaw_offset=-np.pi):
     """
-    yaw_offset: 对原始航向角增加的偏移（弧度）。默认减去 π，使 0 指向 y 正前方。
+    优化版：使用 Matplotlib 绘图，OpenCV 直接写入视频（无中间 PNG，无 FFmpeg）
     """
     # 解析数据并应用偏移
     if use_joint_result:
@@ -244,7 +186,6 @@ def visualize_tracking_from_json(frames_dir, output_video_path, fps=6, dpi=400, 
         all_y = []
         for frame_id in all_frames:
             for (_, x, y, l, w, yaw) in tracking_data.get(frame_id, []):
-                # len_x = w, len_y = l
                 corners = rotated_rectangle_vertices(x, y, w, l, yaw)
                 all_x.extend(corners[:, 0])
                 all_y.extend(corners[:, 1])
@@ -269,10 +210,7 @@ def visualize_tracking_from_json(frames_dir, output_video_path, fps=6, dpi=400, 
         else:
             y_min, y_max = ylim[0], ylim[1]
 
-    temp_dir = os.path.join(os.path.dirname(output_video_path), "temp_frames")
-    os.makedirs(temp_dir, exist_ok=True)
-    print(f"Saving temporary PNG frames to: {temp_dir}")
-
+    # 准备 Matplotlib 绘图环境
     plt.rcParams['figure.dpi'] = dpi
     plt.rcParams['savefig.dpi'] = dpi
     plt.rcParams['font.family'] = 'sans-serif'
@@ -287,17 +225,37 @@ def visualize_tracking_from_json(frames_dir, output_video_path, fps=6, dpi=400, 
     adjusted_figsize = (pixel_width / dpi, pixel_height / dpi)
     
     print(f"Resolution: {pixel_width}x{pixel_height}")
-    print(f"Target bitrate: {bitrate}")
+    print(f"Target bitrate: {bitrate} (Note: OpenCV writing uses default quality - this argument is kept for compatibility)")
+
+    # 创建 Figure 和 Axes（只创建一次）
+    fig, ax = plt.subplots(figsize=adjusted_figsize, dpi=dpi)
+    ax.set_aspect('equal')
+    ax.set_xlabel('X (right) [m]', fontsize=12)
+    ax.set_ylabel('Y (forward) [m]', fontsize=12)
+    ax.grid(True, linestyle='--', alpha=0.5)
+
+    # 初始化 OpenCV 视频写入器
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out_video = cv2.VideoWriter(output_video_path, fourcc, fps, (pixel_width, pixel_height))
+    if not out_video.isOpened():
+        print("Error: Could not create video writer.")
+        plt.close(fig)
+        return
 
     for idx, frame_id in enumerate(all_frames):
         print(f"Rendering frame {idx+1}/{len(all_frames)} (frame_id={frame_id})", end='\r')
-        fig, ax = plt.subplots(figsize=adjusted_figsize, dpi=dpi)
+        
+        # 清空当前帧的所有图形元素
+        ax.clear()
+        
+        # 重新设置坐标轴范围及其他属性（clear 会重置它们）
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(y_min, y_max)
         ax.set_aspect('equal')
         ax.set_xlabel('X (right) [m]', fontsize=12)
         ax.set_ylabel('Y (forward) [m]', fontsize=12)
         ax.set_title(f'Frame {frame_id}', fontsize=14)
+        ax.grid(True, linestyle='--', alpha=0.5)
 
         # 绘制检测框（灰色虚线）
         for (_, x, y, l, w, yaw) in detection_data.get(frame_id, []):
@@ -326,27 +284,22 @@ def visualize_tracking_from_json(frames_dir, output_video_path, fps=6, dpi=400, 
                     fontsize=5, color='white', weight='bold',
                     bbox=dict(facecolor='black', alpha=0.7, boxstyle='round,pad=0.2'))
 
-        ax.grid(True, linestyle='--', alpha=0.5)
-        frame_filename = os.path.join(temp_dir, f"frame_{idx:06d}.png")
-        fig.savefig(frame_filename, dpi=dpi, facecolor='white', edgecolor='none')
-        plt.close(fig)
+        # 直接抓取画布数据并写入视频（无需保存 PNG）
+        fig.canvas.draw()
+        # 获取 RGBA 图像并转换为 BGR（OpenCV 格式）
+        img_rgba = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+        img_rgba = img_rgba.reshape(fig.canvas.get_width_height()[1], fig.canvas.get_width_height()[0], 3)
+        img_bgr = cv2.cvtColor(img_rgba, cv2.COLOR_RGB2BGR)
+        out_video.write(img_bgr)
 
-    print(f"\nAll PNG frames saved. Total: {len(all_frames)}")
-
-    frame_pattern = os.path.join(temp_dir, "frame_%06d.png")
-    success = create_video_with_ffmpeg_simple(frame_pattern, output_video_path, fps=fps, bitrate=bitrate)
-    if success:
-        print(f"✅ High-bitrate video saved to: {output_video_path}")
-    else:
-        print("❌ Failed to create video")
-
-    print("Cleaning up temporary files...")
-    shutil.rmtree(temp_dir)
-    print("Done!")
+    # 释放资源
+    out_video.release()
+    plt.close(fig)
+    print(f"\n✅ Video saved to: {output_video_path}")
 
 if __name__ == "__main__":
     import argparse as _ap
-    _p = _ap.ArgumentParser(description="Tracking 可视化 — 将 tracks.json / joint_result.json 渲染为 BEV 视频")
+    _p = _ap.ArgumentParser(description="Tracking 可视化 — 将 tracks.json / joint_result.json 渲染为 BEV 视频 (OpenCV 直写版)")
     _p.add_argument("--frames-dir", type=str, default=None,
                     help="包含 frame_* 子目录的帧数据根目录（默认: outputs/frames）")
     _p.add_argument("--out-video",  type=str, default=None,
@@ -359,7 +312,7 @@ if __name__ == "__main__":
     _p.add_argument("--figsize",    type=int, default=6,
                     help="图像尺寸（正方形，单位英寸，默认 6）")
     _p.add_argument("--bitrate",    type=str, default="10M",
-                    help="输出视频码率")
+                    help="输出视频码率（OpenCV 写入时忽略此参数，保留以兼容）")
     _p.add_argument("--xlim",       type=float, nargs=2, metavar=('MIN','MAX'), default=[-40.0, 40.0],
                     help="手动设置 X 轴范围")
     _p.add_argument("--ylim",       type=float, nargs=2, metavar=('MIN','MAX'), default=[-40.0, 40.0],

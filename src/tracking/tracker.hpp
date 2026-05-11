@@ -40,6 +40,7 @@ struct TrackerConfig {
 
     // 功能开关
     bool enable_ego_comp    = true;   // 启用自车运动补偿（修复航向角跳变）
+    bool enable_prediction = true;
 };
 
 // ─── 自车全局位姿（用于 ego 运动补偿）──────────────────────────

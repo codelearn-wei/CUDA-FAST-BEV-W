@@ -8,22 +8,7 @@ CUDA-FastBEV 多帧可视化视频生成工具
   - 组合 6 路相机画面 + BEV 视图为完整帧
   - 输出 MP4 视频文件，可选逐帧保存图像
 
-用法:
-  # 基于批量推理结果生成视频（先用 ./build/fastbev --batch 生成 JSON）
-  python tools/video_demo.py \\
-      --frames-dir outputs/frames \\
-      --out-dir    outputs/video \\
-      --model      resnet18 \\
-      --score-thr  0.35
-
-  # 自动调用 C++ 推理（需要已编译 build/fastbev）
-  python tools/video_demo.py \\
-      --frames-dir outputs/frames \\
-      --out-dir    outputs/video \\
-      --model      resnet18 \\
-      --auto-infer
-
-环境: conda activate bev
+  支持跟踪结果可视化（当 joint_result.json 中包含 tracks 时）
 """
 
 import argparse
@@ -78,6 +63,10 @@ FG_SUBTEXT = (168, 176, 180)
 FG_GRID = (62, 72, 68)
 FG_AXIS = (115, 128, 124)
 EGO_COLOR = (245, 245, 245)
+
+# 跟踪框专用颜色（橙色）
+TRACK_COLOR = (0, 140, 255)        # BGR: 橙黄
+TRACK_DASH_LEN = 8                 # 虚线长度（像素）
 
 # ─── BEV 视野参数 ────────────────────────────────────────────────────────────
 EGO_FORWARD   =  60.0   # 前向 60m
@@ -405,6 +394,92 @@ def render_bev_detections(
     return legend_counts
 
 
+# ───── 新增：跟踪结果渲染（虚线边框 + track_id + 速度箭头）───────────────────
+def render_bev_tracks(
+    canvas: np.ndarray,
+    tracks: list,
+    bounds,
+    bev_size: int,
+    ego_yaw_global: float = None,
+    bev_mode: str = "world",
+    show_vel_arrow: bool = True,
+) -> None:
+    """
+    在 BEV 画布上绘制跟踪轨迹（来自 joint_result.json 的 tracks 字段）。
+    样式：橙色虚线边框，显示 track_id，可选速度箭头。
+    """
+    if not tracks:
+        return
+
+    # 为每个 track_id 生成稳定的颜色（基于 id 哈希）
+    def track_color(tid: int):
+        np.random.seed(tid)
+        r = int(np.random.randint(100, 220))
+        g = int(np.random.randint(100, 220))
+        b = int(np.random.randint(100, 220))
+        return (b, g, r)  # BGR
+
+    corners_3d = boxes_to_corners_3d(tracks)  # 复用 3D 角点计算（tracks 有相同的几何字段）
+    for idx, trk in enumerate(tracks):
+        tid = trk.get("track_id", idx)
+        color = track_color(tid)  # 不同轨迹不同颜色，便于区分
+        # 也可以统一用 TRACK_COLOR，但多种颜色更直观
+        # 获取底面角点（世界坐标）
+        bottom_world = corners_3d[idx, :4, :2]  # [4,2]
+        if bev_mode == "world" and ego_yaw_global is not None:
+            bottom_world = transform_model_local_to_world_relative(bottom_world, float(ego_yaw_global))
+        else:
+            bottom_world = model_local_to_display(bottom_world)
+        bottom_c = metric_to_canvas(bottom_world, bounds, bev_size)
+
+        # 绘制虚线边框（模拟虚线）
+        for s, e in BEV_EDGES:
+            pt1 = bottom_c[s]
+            pt2 = bottom_c[e]
+            # 计算线段长度，生成等距点
+            length = np.linalg.norm(pt2 - pt1)
+            if length < 1e-4:
+                continue
+            n_seg = max(4, int(length / TRACK_DASH_LEN))
+            for k in range(n_seg):
+                t1 = k / n_seg
+                t2 = (k + 1) / n_seg
+                if k % 2 == 0:  # 只画奇数段，制造虚线效果
+                    p1 = (pt1 * (1 - t1) + pt2 * t1).astype(int)
+                    p2 = (pt1 * (1 - t2) + pt2 * t2).astype(int)
+                    cv2.line(canvas, tuple(p1), tuple(p2), color, 2, cv2.LINE_AA)
+
+        # 中心点（用于显示 ID 和速度箭头）
+        cx_world = np.array([[trk.get("position", [0, 0])[0], trk.get("position", [0, 0])[1]]], dtype=np.float32)
+        if bev_mode == "world" and ego_yaw_global is not None:
+            cx_world = transform_model_local_to_world_relative(cx_world, float(ego_yaw_global))
+        else:
+            cx_world = model_local_to_display(cx_world)
+        center_c = metric_to_canvas(cx_world, bounds, bev_size)[0]
+
+        # 显示 track_id
+        cv2.putText(canvas, f"ID:{tid}", (center_c[0] - 12, center_c[1] - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+        # 可选速度箭头（局部速度）
+        if show_vel_arrow:
+            vx = trk.get("velocity", [0, 0])[0]
+            vy = trk.get("velocity", [0, 0])[1]
+            speed = math.hypot(vx, vy)
+            if speed > 0.2:
+                # 速度向量在世界/显示坐标下需要同方向转换
+                vel_world = np.array([[vx, vy]], dtype=np.float32)
+                if bev_mode == "world" and ego_yaw_global is not None:
+                    vel_world = transform_model_local_to_world_relative(vel_world, float(ego_yaw_global))
+                else:
+                    vel_world = model_local_to_display(vel_world)
+                # 缩放速度向量到合理像素长度（最大 40 像素）
+                vel_pix = (vel_world[0] * 1.5).astype(int)  # 米转像素粗略因子
+                vel_pix = np.clip(vel_pix, -40, 40)
+                tip = center_c + vel_pix
+                cv2.arrowedLine(canvas, tuple(center_c), tuple(tip),
+                                (0, 255, 255), 2, cv2.LINE_AA, tipLength=0.3)
+
+
 # ── 地图元素颜色 ──────────────────────────────────────────────────────────────
 _MAP_COLORS = {
     "divider":     (0, 220, 220),    # 青色  — 车道/道路分隔线
@@ -481,8 +556,9 @@ def render_bev_panel(detections: list, bounds, bev_size: int,
                      ego_speed_forward_mps: float = None,
                      bev_mode: str = "world",
                      show_labels: bool = False,
-                     map_elements: list = None) -> np.ndarray:
-    """生成完整 BEV 检测结果面板（含背景、地图叠加、检测框、图例、自车信息）。"""
+                     map_elements: list = None,
+                     tracks: list = None) -> np.ndarray:          # <-- TRACKING ADD
+    """生成完整 BEV 检测结果面板（含背景、地图叠加、检测框、跟踪框、图例、自车信息）。"""
     canvas = render_bev_background(
         bounds, bev_size,
         ego_yaw_global=display_yaw_global,
@@ -500,6 +576,14 @@ def render_bev_panel(detections: list, bounds, bev_size: int,
         ego_yaw_global=display_yaw_global,
         bev_mode=bev_mode,
         show_labels=show_labels)
+
+    # 绘制跟踪结果（虚线框 + track_id） <-- TRACKING ADD
+    if tracks:
+        render_bev_tracks(
+            canvas, tracks, bounds, bev_size,
+            ego_yaw_global=display_yaw_global,
+            bev_mode=bev_mode,
+            show_vel_arrow=True)
 
     # 自车信息框（左下角）
     speed_kmh = ego_speed_mps * 3.6
@@ -740,20 +824,39 @@ def _convert_joint_dets(joint_dets: list) -> list:
     return out
 
 
-def _load_joint_result(frame_dir: "Path"):
-    """读取 joint_result.json，返回 (detections, map_elements)。
+def _convert_joint_tracks(joint_tracks: list) -> list:          # <-- TRACKING ADD
+    """将 joint_result.json tracks 转换为内部统一格式（与 detection 字段对齐，增加 track_id）。"""
+    out = []
+    for t in joint_tracks:
+        cid = int(t.get("class_id", 0))
+        out.append({
+            "track_id":    t.get("track_id", -1),
+            "center_xyz":  t.get("position", [0, 0, 0]),
+            "size_xyz":    t.get("size", [1, 1, 1]),
+            "yaw":         t.get("yaw", 0),
+            "score":       t.get("score", 0),
+            "label":       cid,
+            "label_name":  CLASS_NAMES[min(cid, len(CLASS_NAMES) - 1)],
+            "velocity":    t.get("velocity", [0, 0]),
+        })
+    return out
+
+
+def _load_joint_result(frame_dir: "Path"):               # <-- TRACKING ADD (modified return triple)
+    """读取 joint_result.json，返回 (detections, map_elements, tracks)。
     detections 已转换为 video_demo.py 内部格式；
-    map_elements 格式与 map_result.json 的 elements 相同（type=str, points=[...]）。
-    若文件不存在或解析失败，返回 (None, None)。
+    map_elements 格式与 map_result.json 的 elements 相同（type=str, points=[...]）；
+    tracks 为 list，每个元素包含 track_id, position, size, yaw, velocity, score 等。
+    若文件不存在或解析失败，返回 (None, None, None)。
     """
     jr_path = frame_dir / "joint_result.json"
     if not jr_path.exists():
-        return None, None
+        return None, None, None
     try:
         with open(jr_path) as f:
             jr = json.load(f)
     except Exception:
-        return None, None
+        return None, None, None
 
     raw_dets = jr.get("detections", [])
     detections = _convert_joint_dets(raw_dets)
@@ -782,7 +885,10 @@ def _load_joint_result(frame_dir: "Path"):
             "subtype": elem.get("subtype", type_name),
         })
 
-    return detections, map_elems
+    raw_tracks = jr.get("tracks", [])                     # <-- TRACKING ADD
+    tracks = _convert_joint_tracks(raw_tracks) if raw_tracks else None
+
+    return detections, map_elems, tracks
 
 
 # ─── 推理调用 ─────────────────────────────────────────────────────────────────
@@ -1002,15 +1108,20 @@ def main():
 
     for render_idx, frame_dir in enumerate(frame_dirs):
         # ── 1. 读取或执行推理 ──
+        tracks = None                     # <-- TRACKING ADD
         if getattr(args, 'joint', False):
-            # joint 模式：从 joint_result.json 读取检测 + 地图
-            _jdets, _jmap = _load_joint_result(frame_dir)
+            # joint 模式：从 joint_result.json 读取检测 + 地图 + 轨迹
+            _jdets, _jmap, _jtracks = _load_joint_result(frame_dir)   # <-- TRACKING ADD
             if _jdets is None:
                 print(f"  [警告] {frame_dir.name}：joint_result.json 缺失，该帧无结果")
                 all_dets = []
                 _jmap = []
+                _jtracks = None
             else:
                 all_dets = _jdets
+                # 注意：_jmap 和 _jtracks 已在 _load_joint_result 中解析
+                if _jtracks:
+                    tracks = _jtracks
         elif getattr(args, 'per_frame_infer', False):
             all_dets = run_inference(
                 args.binary, frame_dir, args.model,
@@ -1100,7 +1211,7 @@ def main():
                     except Exception:
                         map_elements = None
 
-        # ── 3. 渲染 BEV 面板（含自车速度/朝向/地图）──
+        # ── 3. 渲染 BEV 面板（含自车速度/朝向/地图/跟踪框）──
         bev_panel = render_bev_panel(
             detections, BEV_BOUNDS, args.bev_size,
             ego_speed_mps=ego_speed_mps,
@@ -1110,7 +1221,8 @@ def main():
             ego_speed_forward_mps=ego_forward_speed_mps,
             bev_mode=args.bev_mode,
             show_labels=args.show_labels,
-            map_elements=map_elements)
+            map_elements=map_elements,
+            tracks=tracks)          # <-- TRACKING ADD
 
         # ── 4. 组合相机网格（含 3D 框投影）──
         cam_grid = compose_camera_grid(frame_dir, detections, args.cam_width)
@@ -1144,7 +1256,7 @@ def main():
 
         if render_idx % 10 == 0 or render_idx == len(frame_dirs) - 1:
             print(f"  渲染进度: {render_idx + 1}/{len(frame_dirs)}  "
-                  f"检测框: {len(detections)}")
+                  f"检测框: {len(detections)}  跟踪条数: {len(tracks) if tracks else 0}")
 
     if video_writer:
         video_writer.release()

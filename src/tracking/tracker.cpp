@@ -1,11 +1,12 @@
 /**
- * tracker.cpp — 多目标跟踪器实现（调试版，增加速度诊断）
+ * tracker.cpp — 多目标跟踪器实现（增加预测开关，修复幽灵目标）
  */
 
 #include "tracker.hpp"
 #include <algorithm>
 #include <limits>
 #include <cmath>
+#include <unordered_set>
 #include <opencv2/opencv.hpp>
 
 namespace fastbev {
@@ -32,13 +33,19 @@ void localToWorld(float x_local, float y_local, float yaw_local,
                   float& vx_world, float& vy_world) {
     float cos_ego = std::cos(ego.yaw);
     float sin_ego = std::sin(ego.yaw);
-    x_world = ego.x + (-sin_ego) * x_local + cos_ego * y_local;
-    y_world = ego.y +  cos_ego * x_local + sin_ego * y_local;
+    
+    // 位置变换（修正后）
+    x_world = ego.x + sin_ego * x_local + cos_ego * y_local;
+    y_world = ego.y - cos_ego * x_local + sin_ego * y_local;
+    
+    // 朝向变换（保持不变，您确认过正确）
     yaw_world = KalmanFilter::normalizeAngle(ego.yaw + static_cast<float>(M_PI) - yaw_local);
-    // 相对速度旋转到全局
-    float vx_rel_rot = (-sin_ego) * vx_local + cos_ego * vy_local;
-    float vy_rel_rot =  cos_ego * vx_local + sin_ego * vy_local;
-    // 加上自车速度得到绝对速度
+    
+    // 速度变换：先旋转局部速度到全局方向，再加上自车速度
+    // 局部速度 (vx_local, vy_local) 是在 (右, 前) 基底下的，需要转换到全局基底
+    // 全局速度 = 自车速度 + R*(vx_local, vy_local)
+    float vx_rel_rot = sin_ego * vx_local + cos_ego * vy_local;
+    float vy_rel_rot = -cos_ego * vx_local + sin_ego * vy_local;
     vx_world = vx_rel_rot + static_cast<float>(ego.vx);
     vy_world = vy_rel_rot + static_cast<float>(ego.vy);
 }
@@ -53,14 +60,18 @@ void worldToLocal(float x_world, float y_world, float yaw_world,
     float dy = y_world - ego.y;
     float cos_ego = std::cos(ego.yaw);
     float sin_ego = std::sin(ego.yaw);
-    x_local = (-sin_ego) * dx + cos_ego * dy;
+    
+    // 位置逆变换（旋转矩阵的逆 = 转置）
+    x_local =  sin_ego * dx - cos_ego * dy;
     y_local =  cos_ego * dx + sin_ego * dy;
+    
+    // 朝向逆变换（保持不变）
     yaw_local = KalmanFilter::normalizeAngle(ego.yaw + static_cast<float>(M_PI) - yaw_world);
-    // 全局绝对速度减去自车速度得到相对速度
+    
+    // 速度逆变换：全局绝对速度减去自车速度，再旋转回局部基底
     float vx_abs_rel = vx_world - static_cast<float>(ego.vx);
     float vy_abs_rel = vy_world - static_cast<float>(ego.vy);
-    // 旋转回局部
-    vx_local = (-sin_ego) * vx_abs_rel + cos_ego * vy_abs_rel;
+    vx_local =  sin_ego * vx_abs_rel - cos_ego * vy_abs_rel;
     vy_local =  cos_ego * vx_abs_rel + sin_ego * vy_abs_rel;
 }
 
@@ -72,7 +83,7 @@ std::vector<std::vector<float>> Tracker::buildCostMatrix(
     const int n_trk = static_cast<int>(trks.size());
     const int n_det = static_cast<int>(dets.size());
     std::vector<std::vector<float>> cost(n_trk, std::vector<float>(n_det, 1e9f));
-    const float max_angle_diff = static_cast<float>(M_PI) / 2.0f;
+    const float max_angle_diff = static_cast<float>(M_PI) / 1.0f;
     for (int i = 0; i < n_trk; ++i) {
         for (int j = 0; j < n_det; ++j) {
             if (trks[i].class_id != dets[j].class_id) continue;
@@ -81,9 +92,7 @@ std::vector<std::vector<float>> Tracker::buildCostMatrix(
             float diff = std::abs(yaw_trk - yaw_det);
             diff = std::fmod(diff, 2.0f * static_cast<float>(M_PI));
             if (diff > static_cast<float>(M_PI)) diff = 2.0f * static_cast<float>(M_PI) - diff;
-            // 可选：放宽角度限制到 180°（暂时注释掉或保留）
-            // const float max_angle_diff = static_cast<float>(M_PI);  // 180度
-            if (diff > max_angle_diff) continue;  // max_angle_diff 仍使用原值（M_PI/2 或 M_PI）
+            if (diff > max_angle_diff) continue;
             float val = 0.0f;
             switch (cfg_.metric) {
                 case MetricType::DIST_3D:
@@ -302,20 +311,7 @@ Tracker::MatchResult Tracker::dataAssociation(
     return {final_matches, unmatched_dets, unmatched_trks, {}, cost};
 }
 
-// ─── 自车运动补偿（保留，但未使用）──────────────────────────────
-void Tracker::egoMotionCompensation(
-    std::vector<Track>& trks,
-    const EgoPose& prev_ego,
-    const EgoPose& curr_ego) const
-{
-    for (auto& trk : trks) {
-        trk.applyEgoMotionTransform(
-            prev_ego.x, prev_ego.y, prev_ego.yaw,
-            curr_ego.x, curr_ego.y, curr_ego.yaw);
-    }
-}
-
-// ─── 更新已匹配的轨迹（不变）────────────────────────────────────
+// ─── 更新已匹配的轨迹（保持不变形签名，内部根据 cfg_.enable_prediction 决定更新方式）────────
 void Tracker::updateMatchedTracks(
     const std::vector<std::pair<int,int>>& matches,
     const std::vector<Detection>& dets,
@@ -327,7 +323,25 @@ void Tracker::updateMatchedTracks(
         Track& trk = tracks_[trk_idx];
         trk.time_since_update = 0;
         trk.hits++;
-        trk.update(dets[det_idx], timestamp);
+        if (cfg_.enable_prediction) {
+            // 使用卡尔曼滤波更新
+            trk.update(dets[det_idx], timestamp);
+        } else {
+            // 不预测时：直接赋值检测值（世界系），不经过KF
+            const Detection& det = dets[det_idx];
+            trk.x = det.x;
+            trk.y = det.y;
+            trk.z = det.z;
+            trk.yaw = det.yaw;
+            trk.l = det.l;
+            trk.w = det.w;
+            trk.h = det.h;
+            trk.vx = det.vx;
+            trk.vy = det.vy;
+            trk.score = det.score;
+            trk.class_id = det.class_id;
+            trk.state = TrackState::Active;
+        }
     }
 }
 
@@ -372,6 +386,7 @@ void Tracker::reset() {
     next_id_ = 1;
 }
 
+// ─── 主要更新函数（增加预测开关，修复幽灵目标）─────────────────
 std::vector<Track> Tracker::update(const std::vector<Detection>& detections,
                                    double timestamp,
                                    const EgoPose& current_ego) {
@@ -417,26 +432,37 @@ std::vector<Track> Tracker::update(const std::vector<Detection>& detections,
         world_dets = detections;
     }
 
-    double dt = cfg_.dt;
-    for (auto& trk : tracks_) {
-        trk.predict(dt);
+    // ========== 修改点：使用实际帧间时间差进行预测 ==========
+    static double last_timestamp = -1.0;
+    double dt = cfg_.dt;  // fallback
+    if (last_timestamp > 0.0) {
+        dt = timestamp - last_timestamp;
+        if (dt <= 0.0 || dt > 0.5) dt = cfg_.dt;   // 异常保护
+    }
+    last_timestamp = timestamp;
+
+    if (cfg_.enable_prediction) {
+        for (auto& trk : tracks_) {
+            trk.predict(dt);
+        }
     }
 
     auto cost = buildCostMatrix(world_dets, tracks_);
     auto matchRes = dataAssociation(world_dets, tracks_, cost);
 
+    // 记录匹配到的轨迹索引（用于输出，修复幽灵目标）
+    std::unordered_set<int> matched_indices;
     for (const auto& m : matchRes.matches) {
-        Track& trk = tracks_[m.first];
-        const Detection& det = world_dets[m.second];
-        trk.time_since_update = 0;
-        trk.hits++;
-        trk.update(det, timestamp);
+        matched_indices.insert(m.first);
     }
 
-    for (int idx : matchRes.unmatched_dets) {
-        tracks_.emplace_back(next_id_++, world_dets[idx], timestamp);
-    }
+    // 更新匹配的轨迹（内部已根据 cfg_.enable_prediction 决定是否使用卡尔曼更新）
+    updateMatchedTracks(matchRes.matches, world_dets, timestamp);
 
+    // 创建新轨迹
+    createNewTracks(matchRes.unmatched_dets, world_dets, timestamp);
+
+    // 清理超时轨迹
     std::vector<Track> keep;
     for (auto& trk : tracks_) {
         if (trk.state == TrackState::Removed) continue;
@@ -448,29 +474,42 @@ std::vector<Track> Tracker::update(const std::vector<Detection>& detections,
     }
     tracks_ = std::move(keep);
 
+    // 输出确认轨迹：只输出当前帧匹配到的轨迹（解决幽灵目标）
     std::vector<Track> confirmed;
-    for (auto& trk : tracks_) {
+    for (int idx : matched_indices) {
+        if (idx >= static_cast<int>(tracks_.size())) continue;
+        Track& trk = tracks_[idx];
         if (!trk.is_confirmed()) continue;
         Track out_trk = trk;
+        // 无论是否启用 ego 补偿，全局坐标都来自跟踪器内部的状态（trk.x, trk.y, trk.yaw 本来就是全局坐标）
+        out_trk.global_x = trk.x;
+        out_trk.global_y = trk.y;
+        out_trk.global_yaw = trk.yaw;
         if (cfg_.enable_ego_comp && ego_with_vel.valid) {
             float local_x, local_y, local_yaw, local_vx, local_vy;
-            worldToLocal(trk.x, trk.y, trk.yaw, trk.vx, trk.vy, ego_with_vel, local_x, local_y, local_yaw, local_vx, local_vy);
-            out_trk.global_vx = trk.vx;
+            worldToLocal(trk.x, trk.y, trk.yaw, trk.vx, trk.vy, ego_with_vel, 
+                        local_x, local_y, local_yaw, local_vx, local_vy);
+            out_trk.global_vx = trk.vx;   // 全局速度（绝对）
             out_trk.global_vy = trk.vy;
-            out_trk.vx = local_vx;
+            out_trk.vx = local_vx;        // 局部速度（相对）
             out_trk.vy = local_vy;
-            out_trk.x = local_x;
+            out_trk.x = local_x;          // 局部位置
             out_trk.y = local_y;
-            out_trk.yaw = local_yaw;
+            out_trk.yaw = local_yaw;      // 局部朝向
         } else {
+            // 未启用 ego 补偿：全局坐标就是局部坐标，全局速度就是局部速度
             out_trk.global_vx = trk.vx;
             out_trk.global_vy = trk.vy;
+            // 此时 global_x/y/yaw 已经在上方赋值，无需额外操作
+            // 如果希望局部坐标与全局坐标相同，可以显式赋值：
+            out_trk.x = trk.x;
+            out_trk.y = trk.y;
+            out_trk.yaw = trk.yaw;
         }
         confirmed.push_back(out_trk);
     }
     return confirmed;
 }
-
 
 }  // namespace tracking
 }  // namespace fastbev
