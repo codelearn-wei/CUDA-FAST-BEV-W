@@ -85,6 +85,8 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>   // usleep
+#include <opencv2/opencv.hpp>
+#include <set>
 
 using namespace fastbev;
 using namespace fastbev::perception;
@@ -318,6 +320,84 @@ private:
     int fps_;
 };
 
+/// 对 Detection 列表进行置信度、类别过滤 + BEV IoU NMS
+static std::vector<tracking::Detection> filter_detections(
+    const std::vector<tracking::Detection>& dets,
+    float score_thr,
+    const std::set<int>& class_filter,
+    float iou_threshold = 0.3f)
+{
+    // 第一步：置信度 + 类别过滤
+    std::vector<tracking::Detection> filtered;
+    for (const auto& d : dets) {
+        if (d.score < score_thr) continue;
+        if (!class_filter.empty() && class_filter.find(d.class_id) == class_filter.end()) continue;
+        filtered.push_back(d);
+    }
+    if (filtered.empty()) return {};
+
+    // 第二步：BEV IoU 计算辅助函数
+    auto compute_bev_iou = [](const tracking::Detection& a, const tracking::Detection& b) -> float {
+        // 使用 OpenCV RotatedRect 计算两个矩形的 IoU（BEV 平面）
+        cv::RotatedRect rect_a(
+            cv::Point2f(a.x, a.y),
+            cv::Size2f(a.l, a.w),
+            static_cast<float>(-a.yaw * 180.0 / M_PI)
+        );
+        cv::RotatedRect rect_b(
+            cv::Point2f(b.x, b.y),
+            cv::Size2f(b.l, b.w),
+            static_cast<float>(-b.yaw * 180.0 / M_PI)
+        );
+        cv::Point2f points_a[4], points_b[4];
+        rect_a.points(points_a);
+        rect_b.points(points_b);
+        std::vector<cv::Point2f> poly_a(points_a, points_a + 4);
+        std::vector<cv::Point2f> poly_b(points_b, points_b + 4);
+        std::vector<cv::Point2f> intersection;
+        double inter_area = 0.0;
+        if (cv::intersectConvexConvex(poly_a, poly_b, intersection)) {
+            inter_area = cv::contourArea(intersection);
+        }
+        double area_a = rect_a.size.area();
+        double area_b = rect_b.size.area();
+        double union_area = area_a + area_b - inter_area;
+        if (union_area <= 0) return 0.0f;
+        return static_cast<float>(inter_area / union_area);
+    };
+
+    // 第三步：按置信度降序排序
+    std::sort(filtered.begin(), filtered.end(),
+              [](const tracking::Detection& x, const tracking::Detection& y) {
+                  return x.score > y.score;
+              });
+
+    // 第四步：跨类别 NMS
+    std::vector<tracking::Detection> result;
+    std::vector<bool> kept(filtered.size(), false);
+    for (size_t i = 0; i < filtered.size(); ++i) {
+        if (kept[i]) continue;
+        result.push_back(filtered[i]);
+        kept[i] = true;
+        const auto& box_i = filtered[i];
+        float max_diag_i = std::hypot(box_i.l, box_i.w);
+        for (size_t j = i + 1; j < filtered.size(); ++j) {
+            if (kept[j]) continue;
+            float dx = filtered[i].x - filtered[j].x;
+            float dy = filtered[i].y - filtered[j].y;
+            float dist_centers = std::hypot(dx, dy);
+            const auto& box_j = filtered[j];
+            float max_diag_j = std::hypot(box_j.l, box_j.w);
+            if (dist_centers > (max_diag_i + max_diag_j) * 0.5f) continue;
+            float iou = compute_bev_iou(box_i, box_j);
+            if (iou > iou_threshold) {
+                kept[j] = true;
+            }
+        }
+    }
+    return result;
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // 结果 JSON 序列化（与 joint_inference.cpp 格式完全一致）
 // ══════════════════════════════════════════════════════════════════════════════
@@ -353,11 +433,15 @@ static std::string tracks_to_json(const std::vector<tracking::Track>& tracks)
     o << "[\n";
     for (size_t i = 0; i < tracks.size(); ++i) {
         const auto& t = tracks[i];
-        o << "  {\"track_id\": " << t.track_id
+        o << "  {"
+          << "\"track_id\": " << t.track_id
           << ", \"position\": [" << t.x << ", " << t.y << ", " << t.z << "]"
+          << ", \"global_position\": [" << t.global_x << ", " << t.global_y << ", " << t.z << "]"
           << ", \"size\": ["     << t.w << ", " << t.l << ", " << t.h << "]"
           << ", \"yaw\": "       << t.yaw
+          << ", \"global_yaw\": " << t.global_yaw
           << ", \"velocity\": [" << t.vx << ", " << t.vy << "]"
+          << ", \"global_velocity\": [" << t.global_vx << ", " << t.global_vy << "]"
           << ", \"score\": "     << t.score
           << ", \"class_id\": "  << t.class_id
           << "}";
@@ -581,6 +665,15 @@ static void print_usage(const char* prog)
         "  --no-warmup     跳过 TRT warmup\n"
         "  --verbose       打印每帧详细信息\n"
         "\n"
+        "跟踪器参数:\n"
+        "  --track-threshold F  关联阈值（默认 -0.4）\n"
+        "  --track-metric S     度量类型：giou_3d / dist_3d / iou_3d / mahalanobis（默认 giou_3d）\n"
+        "  --track-max-lost N   最大遗失帧数（默认 3）\n"
+        "  --track-dt F         帧间时间差（秒），默认根据仿真fps自动计算\n"
+        "  --track-algo S       匹配算法：greedy / hungarian（默认 greedy）\n"
+        "  --track-min-hits N   最小命中次数（默认 3）\n"
+        "  --track-ego-comp 0|1 是否启用 ego 运动补偿（默认 1）\n"
+        "\n"
         "说明:\n"
         "  FrameSource 模拟 ROS 相机话题：按仿真帧率逐帧发布。\n"
         "  BEV 在主线程执行 GPU 推理 + 跟踪；MapTR 在后台线程并行运行。\n"
@@ -624,6 +717,19 @@ int main(int argc, char** argv)
     bool        use_prefetch = true;
     bool        verbose      = false;
 
+    // 跟踪器参数
+    float       track_threshold  = -0.4f;
+    std::string track_metric_str = "giou_3d";
+    int         track_max_lost   = 3;
+    float       track_dt         = -1.0f;   // -1 表示自动计算
+    std::string track_algo_str   = "greedy";
+    int         track_min_hits   = 3;
+    bool        track_ego_comp   = true;
+
+    // 类别过滤和 NMS 参数（新增）
+    std::set<int> class_filter;              // 保留的类别 ID 集合
+    float         nms_iou_thr = 0.3f;        // NMS IoU 阈值
+
     for (int i = 3; i < argc; ++i) {
         if (!argv[i]) continue;
         if (str_eq(argv[i], "--fps") && i + 1 < argc) {
@@ -650,6 +756,31 @@ int main(int argc, char** argv)
             sim_fps = 0;    // fps=0 → 离线全帧处理
         } else if (str_eq(argv[i], "--verbose")) {
             verbose = true;
+        // ── tracking 参数分支 ──────────────────────────
+        } else if (str_eq(argv[i], "--track-threshold") && i + 1 < argc) {
+            track_threshold = static_cast<float>(atof(argv[++i]));
+        } else if (str_eq(argv[i], "--track-metric") && i + 1 < argc) {
+            track_metric_str = argv[++i];
+        } else if (str_eq(argv[i], "--track-max-lost") && i + 1 < argc) {
+            track_max_lost = atoi(argv[++i]);
+        } else if (str_eq(argv[i], "--track-dt") && i + 1 < argc) {
+            track_dt = static_cast<float>(atof(argv[++i]));
+        } else if (str_eq(argv[i], "--track-algo") && i + 1 < argc) {
+            track_algo_str = argv[++i];
+        } else if (str_eq(argv[i], "--track-min-hits") && i + 1 < argc) {
+            track_min_hits = atoi(argv[++i]);
+        } else if (str_eq(argv[i], "--track-ego-comp") && i + 1 < argc) {
+            track_ego_comp = (atoi(argv[++i]) != 0);
+        // ── 类别过滤和 NMS 参数分支（新增）─────────────
+        } else if (str_eq(argv[i], "--classes") && i + 1 < argc) {
+            std::string cls_str = argv[++i];
+            std::stringstream ss(cls_str);
+            std::string token;
+            while (std::getline(ss, token, ',')) {
+                class_filter.insert(atoi(token.c_str()));
+            }
+        } else if (str_eq(argv[i], "--nms-iou") && i + 1 < argc) {
+            nms_iou_thr = static_cast<float>(atof(argv[++i]));
         } else if (argv[i][0] != '-') {
             precision = argv[i];
         }
@@ -710,15 +841,28 @@ int main(int argc, char** argv)
     }
     printf("[BEV] 推理核心就绪 (%s/%s)\n\n", model_name.c_str(), precision.c_str());
 
-    // ── 外部跟踪器（含 ego 运动补偿） ────────────────────────────────────
+    // 解析cost
+    tracking::MetricType metric;
+    if (track_metric_str == "dist_3d")      metric = tracking::MetricType::DIST_3D;
+    else if (track_metric_str == "iou_3d")  metric = tracking::MetricType::IOU_3D;
+    else if (track_metric_str == "mahalanobis") metric = tracking::MetricType::MAHALANOBIS;
+    else                                    metric = tracking::MetricType::GIOU_3D;
+
+    // 解析匹配算法
+    tracking::AlgoType algo = (track_algo_str == "hungarian") ?
+                            tracking::AlgoType::HUNGARIAN : tracking::AlgoType::GREEDY;
+
+    // 帧间隔 dt：用户指定 >0 则用，否则自动根据仿真 fps 计算
+    float dt = (track_dt > 0) ? track_dt : ((sim_fps > 0) ? 1.0f / sim_fps : 0.05f);
+
     tracking::TrackerConfig tcfg;
-    tcfg.threshold       = -0.4f;
-    tcfg.metric          = tracking::MetricType::GIOU_3D;
-    tcfg.max_lost_frames = 3;
-    tcfg.dt              = (sim_fps > 0) ? 1.0f / sim_fps : 0.05f;
-    tcfg.algo            = tracking::AlgoType::GREEDY;
-    tcfg.min_hits        = 3;
-    tcfg.enable_ego_comp = true;
+    tcfg.threshold       = track_threshold;
+    tcfg.metric          = metric;
+    tcfg.max_lost_frames = track_max_lost;
+    tcfg.dt              = dt;
+    tcfg.algo            = algo;
+    tcfg.min_hits        = track_min_hits;
+    tcfg.enable_ego_comp = track_ego_comp;
     tracking::Tracker tracker(tcfg);
 
     // ── BEV Warmup ────────────────────────────────────────────────────────
@@ -866,6 +1010,9 @@ int main(int argc, char** argv)
         // ── BEV TensorRT 推理 ────────────────────────────────────────────
         auto t_bev0 = std::chrono::high_resolution_clock::now();
         PerceptionResult pr = bev_pipeline.process(bev_frame);
+        if (!class_filter.empty() || nms_iou_thr < 1.0f) {
+            pr.detections = filter_detections(pr.detections, score_thr, class_filter, nms_iou_thr);
+        }
         auto t_bev1 = std::chrono::high_resolution_clock::now();
         lat.bev_ms = std::chrono::duration<double, std::milli>(t_bev1 - t_bev0).count();
 

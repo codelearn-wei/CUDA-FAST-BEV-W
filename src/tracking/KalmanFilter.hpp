@@ -19,7 +19,7 @@ public:
     void predict(double dt);
 
     // 更新（测量值 z: 应为9维或7维，内部自动取前7维可靠观测）
-    void update(const Eigen::VectorXd& z);
+    void update(const Eigen::VectorXd& z_full, double timestamp = 0.0);
 
     // 计算创新矩阵 S = H*P*H' + R（用于马氏距离关联）
     Eigen::MatrixXd computeInnovationMatrix() const;
@@ -58,6 +58,15 @@ private:
     // 用于静止抑制的成员变量
     double last_x_ = 0.0;
     double last_y_ = 0.0;
+
+    bool has_prev_;
+    Eigen::VectorXd prev_measurement_;   // size = dim_z
+    double prev_timestamp_;
+    double min_speed_for_motion_;        // 速度阈值，建议 0.5
+
+    Eigen::MatrixXd Q_base_;             // 基础过程噪声矩阵
+    void applyVehicleKinematics();       // 新增的模型约束函数
+    int init_frame_count_;
 };
 
 } // namespace tracking

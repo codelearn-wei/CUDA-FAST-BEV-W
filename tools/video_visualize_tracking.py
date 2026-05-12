@@ -89,7 +89,7 @@ def parse_tracking_json_frames(frames_dir, yaw_offset=0.0):
     return frame_data
 
 def parse_detection_json_frames(frames_dir, yaw_offset=0.0):
-    """解析 result.json，并应用航向角偏移"""
+    """解析 result.json（兼容 run_pipeline 输出的格式）"""
     frame_data = defaultdict(list)
     subdirs = [d for d in os.listdir(frames_dir) if re.match(r'frame_\d+', d)]
     subdirs.sort(key=lambda s: int(re.search(r'\d+', s).group()))
@@ -104,16 +104,25 @@ def parse_detection_json_frames(frames_dir, yaw_offset=0.0):
             detections = json.load(f)
         
         for det in detections:
-            center = det.get('center_xyz')
-            size = det.get('size_xyz')
-            yaw = det.get('yaw', 0.0) + yaw_offset
-            if center is None or size is None:
-                continue
+            # 兼容两种格式：优先使用 x,y,l,w,yaw
+            if all(k in det for k in ('x', 'y', 'l', 'w', 'yaw')):
+                x = det['x']
+                y = det['y']
+                l = det['l']
+                w = det['w']
+                yaw = det['yaw']
+            else:
+                # 回退到旧格式 center_xyz / size_xyz
+                center = det.get('center_xyz')
+                size = det.get('size_xyz')
+                if center is None or size is None:
+                    continue
+                x, y, _ = center
+                l = size[1]
+                w = size[0]
+                yaw = det.get('yaw', 0.0)
             
-            x, y, z = center
-            l = size[1]   # 长度（纵向）
-            w = size[0]   # 宽度（横向）
-            
+            yaw += yaw_offset
             frame_data[frame_num].append((None, x, y, l, w, yaw))
     
     return frame_data

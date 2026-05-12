@@ -86,7 +86,7 @@ public:
         // 直接传递 7 维可靠观测（位置、航向、尺寸）
         Eigen::VectorXd z(7);
         z << det.x, det.y, det.z, det.yaw, det.l, det.w, det.h;
-        kf_.update(z);
+        kf_.update(z, timestamp);
         syncFromKF();
 
         hits++;
